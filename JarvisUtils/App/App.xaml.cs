@@ -4,6 +4,7 @@ using System.Windows;
 using JarvisUtils.Core;
 using JarvisUtils.Modules.CaseConverter;
 using JarvisUtils.Modules.ClipboardFavorites;
+using JarvisUtils.Modules.CodeMerger;
 using JarvisUtils.Modules.LayoutFixer;
 using JarvisUtils.Modules.PlainTextPaste;
 using JarvisUtils.Modules.ScreenshotOcr;
@@ -62,7 +63,8 @@ public partial class App : Application
             new CaseConverterModule(),
             new TextExpanderModule(),
             new ClipboardFavoritesModule(),
-            new ScreenshotOcrModule()
+            new ScreenshotOcrModule(),
+            new CodeMergerModule()
         ]);
 
         _tray = new TrayHost(services.TrayMenu, _runner);
