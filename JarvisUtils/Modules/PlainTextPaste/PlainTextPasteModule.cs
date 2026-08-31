@@ -48,7 +48,18 @@ public sealed class PlainTextPasteModule : JarvisModuleBase, IHotkeyConfigurable
 
         // восстанавливаем исходный буфер (RTF/HTML/картинка) после вставки
         var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
-        timer.Tick += (_, _) => { timer.Stop(); Services.Clipboard.Restore(backup); };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            try
+            {
+                Services.Clipboard.Restore(backup);
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"Восстановление буфера обмена не удалось: {ex}");
+            }
+        };
         timer.Start();
     }
 

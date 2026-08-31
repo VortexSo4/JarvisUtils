@@ -9,35 +9,53 @@ namespace JarvisUtils.UI.Settings;
 public partial class SettingsWindow : Window
 {
     private readonly ModuleRunner _runner;
+    private readonly GeneralSettingsPage _generalPage = new();
 
     public SettingsWindow(ModuleRunner runner)
     {
         InitializeComponent();
         _runner = runner;
 
+        // Сайдбар: «Общие» (index 0) + модули (index 1..N). Индексы ListBox смещены
+        // на единицу относительно runner.Modules — учтено в SelectionChanged.
+        ModulesList.Items.Add("Общие");
         foreach (var module in runner.Modules)
             ModulesList.Items.Add(module.DisplayName);
         
         ModulesList.SelectionChanged += ModulesList_SelectionChanged;
 
-        // пока окно настроек активно — модули и хоткеи приостановлены:
-        // проверять бинды нужно, переключившись в другое приложение
+        // пока окно настроек активно — модули и хоткеи приостановлены (иначе захват жеста конфликтует)
         Activated += (_, _) => _runner.SuspendAll();
         Deactivated += (_, _) => _runner.ResumeAll();
         Closed += (_, _) => _runner.ResumeAll();
 
-        if (ModulesList.Items.Count > 0) ModulesList.SelectedIndex = 0;
+        ModulesList.SelectedIndex = 0; // по умолчанию — «Общие»
     }
 
     private void ModulesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         int index = ModulesList.SelectedIndex;
         EditorHost.Children.Clear();
-        if (index < 0 || index >= _runner.Modules.Count) return;
-        BuildEditor(_runner.Modules[index]);
+        if (index < 0) return;
+        if (index == 0) { BuildGeneralPage(); return; } // «Общие» — страница приложения
+        int moduleIndex = index - 1;                    // модули начинаются с индекса 1
+        if (moduleIndex >= _runner.Modules.Count) return;
+        BuildModuleEditor(_runner.Modules[moduleIndex]);
     }
 
-    private void BuildEditor(IJarvisModule module)
+    private void BuildGeneralPage()
+    {
+        EditorHost.Children.Add(new TextBlock
+        {
+            Text = "Общие",
+            FontSize = 20,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 4)
+        });
+        EditorHost.Children.Add(_generalPage.BuildEditor());
+    }
+
+    private void BuildModuleEditor(IJarvisModule module)
     {
         // ── Шапка: название + тумблер ──
         var header = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
@@ -75,7 +93,7 @@ public partial class SettingsWindow : Window
 
         if (module is IHotkeyConfigurable configurable)
         {
-            EditorHost.Children.Add(Section("ГОРЯЧИЕ КЛАВИШИ"));
+            EditorHost.Children.Add(SettingsUi.Section("ГОРЯЧИЕ КЛАВИШИ"));
             foreach (var slot in configurable.HotkeySlots)
             {
                 var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 5, 0, 5) };
@@ -143,13 +161,4 @@ public partial class SettingsWindow : Window
         }
         return null;
     }
-
-    private static TextBlock Section(string title) => new()
-    {
-        Text = title,
-        Foreground = JarvisTheme.ForegroundBrush(0.42),
-        FontSize = 11,
-        FontWeight = FontWeights.SemiBold,
-        Margin = new Thickness(0, 22, 0, 8)
-    };
 }

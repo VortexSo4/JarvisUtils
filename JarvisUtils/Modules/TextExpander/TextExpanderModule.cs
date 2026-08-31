@@ -18,7 +18,7 @@ namespace JarvisUtils.Modules.TextExpander;
 // ─── Основной модуль ────────────────────────────────────────────────
 public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 {
-    private const bool TraceKeys = true;
+    private const bool TraceKeys = false;
 
     // Реестр встроенных функций
     private static readonly Dictionary<string, IExpansionFunction> Functions = new()

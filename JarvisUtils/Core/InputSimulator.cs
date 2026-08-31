@@ -10,34 +10,28 @@ public sealed class InputSimulator : IInputSimulator
 {
     private const ushort VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_CONTROL = 0x11, VK_C = 0x43, VK_V = 0x56;
 
+    // Буфер обмена Windows — общий COM-ресурс, к которому может параллельно
+    // обращаться антивирус, менеджеры буфера обмена, сама ОС и т.п. Открытие
+    // (OpenClipboard) может кратковременно фейлиться — это нормально и ожидаемо,
+    // поэтому все операции с буфером идут через короткий ограниченный ретрай,
+    // а не через один вызов и не через бесконечный цикл.
+    private const int ClipboardRetries = 5;
+    private const int ClipboardRetryDelayMs = 40;
+
     /// <summary>
     /// Вставляет текст через буфер обмена (Ctrl+V) вместо посимвольной юникод-печати —
-    /// быстрее и атомарно для приложения-получателя, что убирает гонки на длинных
-    /// многострочных заменах. Текущее содержимое буфера сохраняется перед вставкой и
-    /// восстанавливается после, чтобы не затирать то, что было скопировано у пользователя.
+    /// быстрее и атомарно для приложения-получателя. Текущее содержимое буфера
+    /// сохраняется перед вставкой и восстанавливается после, чтобы не затирать то,
+    /// что было скопировано у пользователя.
     /// </summary>
     public void SendText(string text)
     {
-        IDataObject? backup = null;
-        try
-        {
-            backup = TryGetClipboardBackup();
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"SendText: не удалось прочитать текущий буфер перед вставкой — {ex.Message}");
-        }
+        var backup = TryGetClipboardBackup();
 
-        try
+        if (!TrySetClipboardText(text))
         {
-            Clipboard.SetText(text);
-        }
-        catch (Exception ex)
-        {
-            // Буфер обмена бывает временно занят другим процессом в Windows — короткий ретрай.
-            Log.Warn($"SendText: Clipboard.SetText не удался, ретрай — {ex.Message}");
-            Thread.Sleep(30);
-            Clipboard.SetText(text);
+            Log.Warn("SendText: не удалось положить текст в буфер обмена после всех попыток — вставка отменена");
+            return;
         }
 
         SendCtrlV();
@@ -57,15 +51,46 @@ public sealed class InputSimulator : IInputSimulator
     /// <summary>Выделение в целевом приложении остаётся активным, поэтому достаточно «напечатать» текст поверх него.</summary>
     public void ReplaceSelection(string text) => SendText(text);
 
-    // ── Буфер обмена: backup / restore ──
+    // ── Буфер обмена: backup / restore, всё с ограниченными ретраями ──
 
     private static IDataObject? TryGetClipboardBackup()
     {
-        // Оборачиваем в новый DataObject, чтобы снять независимую копию данных прямо
-        // сейчас — "живой" объект от Clipboard.GetDataObject() может стать недействительным
-        // после следующего SetText.
-        var current = Clipboard.GetDataObject();
-        return current != null ? new DataObject(current) : null;
+        for (int attempt = 1; attempt <= ClipboardRetries; attempt++)
+        {
+            try
+            {
+                var current = Clipboard.GetDataObject();
+                // Оборачиваем в новый DataObject, чтобы снять независимую копию данных —
+                // "живой" объект от Clipboard.GetDataObject() может стать недействительным
+                // после последующего SetText.
+                return current != null ? new DataObject(current) : null;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"SendText: чтение буфера перед вставкой не удалось (попытка {attempt}/{ClipboardRetries}) — {ex.Message}");
+                if (attempt < ClipboardRetries) Thread.Sleep(ClipboardRetryDelayMs);
+            }
+        }
+        Log.Warn("SendText: не удалось прочитать текущий буфер — восстановление после вставки будет пропущено");
+        return null;
+    }
+
+    private static bool TrySetClipboardText(string text)
+    {
+        for (int attempt = 1; attempt <= ClipboardRetries; attempt++)
+        {
+            try
+            {
+                Clipboard.SetText(text);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"SendText: Clipboard.SetText не удался (попытка {attempt}/{ClipboardRetries}) — {ex.Message}");
+                if (attempt < ClipboardRetries) Thread.Sleep(ClipboardRetryDelayMs);
+            }
+        }
+        return false;
     }
 
     private static void RestoreClipboardAfterDelay(IDataObject? backup)
@@ -78,16 +103,27 @@ public sealed class InputSimulator : IInputSimulator
         timer.Tick += (_, _) =>
         {
             timer.Stop();
+            TrySetClipboardData(backup);
+        };
+        timer.Start();
+    }
+
+    private static void TrySetClipboardData(IDataObject data)
+    {
+        for (int attempt = 1; attempt <= ClipboardRetries; attempt++)
+        {
             try
             {
-                Clipboard.SetDataObject(backup, true);
+                Clipboard.SetDataObject(data, true);
+                return;
             }
             catch (Exception ex)
             {
-                Log.Warn($"SendText: не удалось восстановить буфер обмена — {ex.Message}");
+                Log.Warn($"SendText: восстановление буфера не удалось (попытка {attempt}/{ClipboardRetries}) — {ex.Message}");
+                if (attempt < ClipboardRetries) Thread.Sleep(ClipboardRetryDelayMs);
             }
-        };
-        timer.Start();
+        }
+        Log.Warn("SendText: буфер не восстановлен после всех попыток — прежнее содержимое буфера утеряно");
     }
 
     // ── Низкоуровневые примитивы ──
