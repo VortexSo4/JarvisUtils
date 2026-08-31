@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,39 +15,28 @@ using JarvisUtils.Core;
 
 namespace JarvisUtils.Modules.TextExpander;
 
+// ─── Основной модуль ────────────────────────────────────────────────
 public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 {
-    /// <summary>
-    /// true → писать в jarvis.log каждый распознанный символ и буфер (для диагностики).
-    /// ВНИМАНИЕ: в лог попадёт всё, что вы набираете, — включать только на время
-    /// отладки и выключать после. По умолчанию false.
-    /// </summary>
     private const bool TraceKeys = true;
 
-    /// <summary>
-    /// Параметризованный триггер последовательности чисел: :incr1-10: или :incr1-10n:
-    /// (n на конце — каждое число на новой строке). Ведущие нули в начальном числе
-    /// (например :incr01-10:) сохраняют фиксированную ширину для всех чисел диапазона.
-    /// Разворачивается целиком за один вызов — состояние между вызовами не хранится.
-    /// </summary>
-    private static readonly Regex IncrPattern = new(@":incr(\d+)-(\d+)(n)?:$", RegexOptions.Compiled);
-
-    public sealed class AbbrRow
+    // Реестр встроенных функций
+    private static readonly Dictionary<string, IExpansionFunction> Functions = new()
     {
-        public string Abbr { get; set; } = "";
-        public string Replacement { get; set; } = "";
-    }
+        ["incr"] = new IncrFunction(),
+        ["rand"] = new RandFunction(),
+        ["date"] = new DateFunction(),
+        ["time"] = new TimeFunction(),
+        ["repeat"] = new RepeatFunction(),
+        ["calc"] = new CalcFunction(),
+    };
+
+    // Кеш скомпилированных регулярных выражений для каждого правила
+    private readonly ConcurrentDictionary<ExpansionRule, Regex> _regexCache = new();
 
     public sealed class Settings
     {
-        public Dictionary<string, string> Abbreviations { get; set; } = new()
-        {
-            [":em"] = "user@example.com",
-            [":nm"] = "Иван Иванов",
-            [":dt"] = "{date}",
-            [":tm"] = "{time}",
-            [":sig"] = "С уважением,\nИван Иванов\nuser@example.com"
-        };
+        public List<ExpansionRule> Rules { get; set; } = new();
     }
 
     private Settings _settings = null!;
@@ -54,10 +45,10 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
     private DispatcherTimer? _idle;
     private IntPtr _lastFocus = IntPtr.Zero;
 
-    // ── UI редактора (пересоздаётся при каждом открытии настроек) ──
+    // ── UI редактора ──
     private static readonly Color CardIdle = Color.FromRgb(0x19, 0x1C, 0x25);
     private static readonly Color CardHover = Color.FromRgb(0x1F, 0x23, 0x30);
-    private readonly List<AbbrRow> _rows = [];
+    private readonly List<ExpansionRule> _rows = new();
     private StackPanel? _rowsPanel;
     private TextBlock? _savedLabel;
     private DispatcherTimer? _saveDebounce;
@@ -65,15 +56,21 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
     public override string DisplayName => "Текстовые сокращения";
 
-    protected override void RegisterHotkeys() { } // realtime-матчинг через keyboard hook
+    protected override void RegisterHotkeys() { } // нет хоткеев
 
     public override void Initialize(IJarvisServices services)
     {
-        _settings = services.Settings.Load<Settings>(Name);
-        Log.Info($"TextExpander: загружено сокращений — {_settings.Abbreviations.Count}"); // маячок: пусто = файл настроек пуст
+        // Сначала вызываем базовую инициализацию, чтобы установить Services
+        base.Initialize(services);
+
+        // Теперь загружаем настройки
+        _settings = Services.Settings.Load<Settings>(Name);
+        if (_settings.Rules == null) _settings.Rules = new List<ExpansionRule>();
+
+        Log.Info($"TextExpander: загружено правил — {_settings.Rules.Count}");
+
         _idle = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _idle.Tick += (_, _) => _buffer.Clear();
-        base.Initialize(services);
     }
 
     protected override void OnEnabled()
@@ -81,8 +78,8 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         _lastFocus = WinApi.GetForegroundWindow();
         Services.Keyboard.KeyDown += OnKeyDown;
         Services.Keyboard.KeyUp += OnKeyUp;
-        Services.Keyboard.MouseDown += OnGlobalMouseDown; // клик мышью = перенос каретки → контекст набора сброшен
-        Log.Info("TextExpander: подписка на клавиатуру активна"); // маячок: события хука доходят до модуля
+        Services.Keyboard.MouseDown += OnGlobalMouseDown;
+        Log.Info("TextExpander: подписка на клавиатуру активна");
     }
 
     protected override void OnDisabled()
@@ -96,10 +93,9 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
     private void OnKeyDown(object? sender, KeyHookEventArgs e)
     {
-        if (e.IsInjected || Suspended) return; // собственные SendInput-события не буферизуем
+        if (e.IsInjected || Suspended) return;
         _keyboard.OnKey(e.Vk, true);
 
-        // смена активного окна — набор идёт в другое поле, буфер сбрасываем
         var focus = WinApi.GetForegroundWindow();
         if (focus != _lastFocus) { _lastFocus = focus; _buffer.Clear(); }
 
@@ -108,20 +104,20 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
         switch (e.Vk)
         {
-            case 0x08: // Backspace — откат символа буфера
+            case 0x08: // Backspace
                 if (_buffer.Length > 0) _buffer.Length--;
                 return;
-            case 0x1B or 0x0D or 0x09: // Esc / Enter / Tab
+            case 0x1B or 0x0D or 0x09: // Esc/Enter/Tab
                 _buffer.Clear();
                 return;
-            case >= 0x70 and <= 0x87: // F1–F24
+            case >= 0x70 and <= 0x87: // F-keys
                 _buffer.Clear();
                 return;
-            case 0x21 or 0x22 or 0x23 or 0x24 or 0x25 or 0x26 or 0x27 or 0x28 or 0x2C or 0x2D or 0x2E: // навигация
-            case 0x10 or 0x11 or 0x12 or 0x5B or 0x5C or 0xA0 or 0xA1 or 0xA2 or 0xA3 or 0xA4 or 0xA5: // модификаторы
-                return; // сами по себе буфер не ломают
+            case 0x21 or 0x22 or 0x23 or 0x24 or 0x25 or 0x26 or 0x27 or 0x28 or 0x2C or 0x2D or 0x2E:
+            case 0x10 or 0x11 or 0x12 or 0x5B or 0x5C or 0xA0 or 0xA1 or 0xA2 or 0xA3 or 0xA4 or 0xA5:
+                return;
         }
-        if (_keyboard.HasNonShiftModifier) { _buffer.Clear(); return; } // Ctrl+V / Alt+Tab и т.п. — не текст
+        if (_keyboard.HasNonShiftModifier) { _buffer.Clear(); return; }
 
         var ch = _keyboard.CharFromKey(e.Vk, e.ScanCode);
         if (ch is null)
@@ -145,119 +141,109 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
     private void OnGlobalMouseDown(object? sender, MouseHookEventArgs e) => _buffer.Clear();
 
+    // ── Основная логика поиска и подстановки ──
+
     private void TryExpand()
     {
         var raw = _buffer.ToString();
-
-        // ── Параметризованный триггер :incrN-M: / :incrN-Mn: — проверяем первым,
-        // т.к. это не литерал из словаря, а генерируемое значение ──
-        var incrMatch = IncrPattern.Match(raw);
-        if (incrMatch.Success)
+        foreach (var rule in _settings.Rules.OrderByDescending(r => r.TriggerPattern.Length))
         {
-            var replacement = BuildIncrSequence(incrMatch);
-            if (replacement != null)
-            {
-                Expand(incrMatch.Value, replacement);
-                return;
-            }
-            // от→до некорректны (например from > to) — просто не разворачиваем,
-            // даём человеку допечатать/поправить дальше
-        }
+            if (string.IsNullOrEmpty(rule.TriggerPattern)) continue;
 
-        string? best = null;
-        foreach (var abbr in _settings.Abbreviations.Keys.OrderByDescending(a => a.Length))
-        {
-            if (abbr.Length == 0) continue;
-            if (MatchesSuffix(raw, abbr))
-            {
-                best = abbr;
-                break;
-            }
-        }
-        if (best == null) return;
+            var regex = GetRegex(rule);
+            var match = regex.Match(raw);
+            if (!match.Success) continue;
 
-        var repl = ExpandTokens(_settings.Abbreviations[best]);
-        Expand(best, repl);
+            // Извлекаем параметры
+            var args = new List<string>();
+            int groupIndex = 1;
+            while (true)
+            {
+                var groupName = $"p{groupIndex}";
+                var group = match.Groups[groupName];
+                if (!group.Success) break;
+                args.Add(group.Value);
+                groupIndex++;
+            }
+
+            // Подставляем параметры в шаблон замены
+            var replacement = rule.ReplacementTemplate;
+            for (int i = 0; i < args.Count; i++)
+                replacement = replacement.Replace($"%{i + 1}", args[i]);
+
+            // Обрабатываем встроенные функции
+            var final = ExpandTokens(replacement);
+
+            int len = match.Length;
+            _buffer.Clear();
+            Log.Info($"TextExpander: сработало '{match.Value}' (шаблон '{rule.TriggerPattern}')");
+            Application.Current.Dispatcher.BeginInvoke(DispatcherPriority.Input, () =>
+            {
+                Services.Input.SendBackspaces(len);
+                Services.Input.SendText(final);
+            });
+            break;
+        }
     }
 
-    /// <summary>
-    /// Разворачивает :incrN-M(n)?: в строку со всеми числами диапазона [from..to] включительно.
-    /// Без n — через пробел в одну строку. С n — каждое число на отдельной строке.
-    /// Ведущие нули в исходном "from" (например "01") сохраняют фиксированную ширину у всех чисел.
-    /// Возвращает null, если границы некорректны (from > to).
-    /// </summary>
-    private static string? BuildIncrSequence(Match m)
+    private static Regex BuildRegexFromPattern(string pattern)
     {
-        var fromRaw = m.Groups[1].Value;
-        var toRaw = m.Groups[2].Value;
-        bool newline = m.Groups[3].Success;
-
-        int from = int.Parse(fromRaw);
-        int to = int.Parse(toRaw);
-        if (from > to) return null;
-
-        int width = fromRaw.StartsWith('0') ? fromRaw.Length : 0; // ширина с нулями, только если явно задана
-        var sep = newline ? "\n" : " ";
-
-        var sb = new StringBuilder();
-        for (int i = from; i <= to; i++)
+        var escaped = Regex.Escape(pattern);
+        var regexPattern = Regex.Replace(escaped, @"%(\d)", m =>
         {
-            if (i > from) sb.Append(sep);
-            sb.Append(width > 0 ? i.ToString().PadLeft(width, '0') : i.ToString());
-        }
-        return sb.ToString();
+            int num = int.Parse(m.Groups[1].Value);
+            return $"(?<p{num}>.+?)";
+        });
+        return new Regex(regexPattern + "$", RegexOptions.Compiled);
     }
 
-    /// <summary>Стирает набранный триггер и печатает замену. Общая точка выхода для всех видов срабатывания.</summary>
-    private void Expand(string trigger, string replacement)
+    private Regex GetRegex(ExpansionRule rule)
     {
-        var typed = _buffer.ToString();
-        _buffer.Clear();
-        int len = trigger.Length; // ToEnglish взаимно-однозначен: длина = число реально набранных символов
-        Log.Info($"TextExpander: сработало '{trigger}' (набрано '{typed}')"); // маячок: матч найден
+        return _regexCache.GetOrAdd(rule, r => BuildRegexFromPattern(r.TriggerPattern));
+    }
 
-        // SendInput не вызываем прямо внутри hook-коллбэка — откладываем на следующую итерацию диспетчера
-        Application.Current.Dispatcher.BeginInvoke(DispatcherPriority.Input, () =>
+    private static string ExpandTokens(string input)
+    {
+        var pattern = @"\{(\w+)(?:\(([^)]*)\))?\}";
+        return Regex.Replace(input, pattern, match =>
         {
-            Services.Input.SendBackspaces(len);
-            Services.Input.SendText(replacement);
+            string funcName = match.Groups[1].Value;
+            string argsRaw = match.Groups[2].Success ? match.Groups[2].Value : "";
+            var args = argsRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            if (Functions.TryGetValue(funcName, out var func))
+            {
+                var result = func.Evaluate(args);
+                return result ?? match.Value;
+            }
+            return match.Value;
         });
     }
 
-    /// <summary>Регистронезависимый суффикс-матч с защитой от срабатывания в середине слова.</summary>
-    private static bool MatchesSuffix(string text, string abbr)
-    {
-        if (!text.EndsWith(abbr, StringComparison.OrdinalIgnoreCase)) return false;
-        int start = text.Length - abbr.Length;
-        if (start > 0 && char.IsLetterOrDigit(text[start - 1]) && char.IsLetterOrDigit(abbr[0])) return false;
-        return true;
-    }
-
-    private static string ExpandTokens(string s) =>
-        s.Replace("{date}", DateTime.Now.ToString("dd.MM.yyyy")).Replace("{time}", DateTime.Now.ToString("HH:mm"));
-
-    // ══════════════ Редактор настроек ══════════════
+    // ══════════════ РЕДАКТОР НАСТРОЕК ══════════════
 
     public FrameworkElement BuildEditor()
     {
         _rows.Clear();
-        _rows.AddRange(_settings.Abbreviations.Select(kv => new AbbrRow { Abbr = kv.Key, Replacement = kv.Value }));
+        _rows.AddRange(_settings.Rules);
 
         var root = new StackPanel { Margin = new Thickness(0, 6, 0, 0) };
 
         root.Children.Add(new TextBlock
         {
-            Text = "Наберите сокращение в любом поле ввода — оно развернётся в замену. Регистр и раскладка не важны. В замене поддерживаются {date} и {time}. Отдельно доступен :incrN-M: (и :incrN-Mn: с переносом строк) — разворачивается в числа от N до M.",
+            Text = "Правило: шаблон триггера с маркерами %1, %2, … (например :rand%1-%2:) и шаблон замены, в котором можно использовать те же маркеры и функции: {rand(1,100)}, {date}, {time}, {repeat(3,hello)}, {incr(1,10,n)}, {calc(12+34)}.",
             Foreground = JarvisTheme.ForegroundBrush(0.55),
             FontSize = 12.5,
             TextWrapping = TextWrapping.Wrap
         });
 
         var head = new Grid { Margin = new Thickness(12, 18, 12, 6) };
-        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(130) });
         head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var h1 = HeadLabel("СОКРАЩЕНИЕ"); Grid.SetColumn(h1, 0);
-        var h2 = HeadLabel("ЗАМЕНА"); Grid.SetColumn(h2, 1);
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var h1 = HeadLabel("ШАБЛОН ТРИГГЕРА");
+        var h2 = HeadLabel("ШАБЛОН ЗАМЕНЫ");
+        Grid.SetColumn(h1, 0);
+        Grid.SetColumn(h2, 1);
         head.Children.Add(h1);
         head.Children.Add(h2);
         root.Children.Add(head);
@@ -279,7 +265,7 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
         var add = new Button
         {
-            Content = "+  Добавить сокращение",
+            Content = "+  Добавить правило",
             HorizontalAlignment = HorizontalAlignment.Left,
             Margin = new Thickness(0, 10, 0, 0)
         };
@@ -297,7 +283,7 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         _saveDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
         _saveDebounce.Tick += (_, _) => { _saveDebounce!.Stop(); FlushSave(); };
 
-        root.Unloaded += (_, _) => FlushSave(); // досохраняем при закрытии настроек
+        root.Unloaded += (_, _) => FlushSave();
         return root;
     }
 
@@ -311,31 +297,23 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
     private static TextBlock EmptyHint() => new()
     {
-        Text = "Пока нет сокращений — добавьте первое.",
+        Text = "Пока нет правил — добавьте первое.",
         Foreground = JarvisTheme.ForegroundBrush(0.4),
         FontSize = 12.5,
         Margin = new Thickness(12, 8, 0, 8)
     };
 
-    private Border BuildRow(AbbrRow model)
+    private Border BuildRow(ExpansionRule model)
     {
-        var abbr = new TextBox
+        var trigger = new TextBox
         {
-            Width = 130,
             FontFamily = new FontFamily("Consolas"),
-            VerticalAlignment = VerticalAlignment.Top
-        };
-        abbr.SetBinding(TextBox.TextProperty, new Binding(nameof(AbbrRow.Abbr))
-        { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
-        abbr.TextChanged += (_, _) => ScheduleSave();
-
-        var arrow = new TextBlock
-        {
-            Text = "→",
-            Foreground = JarvisTheme.ForegroundBrush(0.35),
             VerticalAlignment = VerticalAlignment.Top,
-            Margin = new Thickness(10, 11, 10, 0)
+            TextWrapping = TextWrapping.NoWrap
         };
+        trigger.SetBinding(TextBox.TextProperty, new Binding(nameof(ExpansionRule.TriggerPattern))
+        { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
+        trigger.TextChanged += (_, _) => ScheduleSave();
 
         var repl = new TextBox
         {
@@ -345,7 +323,7 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
             MaxHeight = 110,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         };
-        repl.SetBinding(TextBox.TextProperty, new Binding(nameof(AbbrRow.Replacement))
+        repl.SetBinding(TextBox.TextProperty, new Binding(nameof(ExpansionRule.ReplacementTemplate))
         { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
         repl.TextChanged += (_, _) => ScheduleSave();
 
@@ -355,24 +333,37 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         del.VerticalAlignment = VerticalAlignment.Top;
 
         var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(130) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        Grid.SetColumn(abbr, 0); Grid.SetColumn(arrow, 1); Grid.SetColumn(repl, 2); Grid.SetColumn(del, 3);
-        grid.Children.Add(abbr);
+        Grid.SetColumn(trigger, 0);
+        Grid.SetColumn(repl, 2);
+        Grid.SetColumn(del, 3);
+
+        var arrow = new TextBlock
+        {
+            Text = "→",
+            Foreground = JarvisTheme.ForegroundBrush(0.35),
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(6, 0, 6, 0)
+        };
+        Grid.SetColumn(arrow, 1);
+
+        grid.Children.Add(trigger);
         grid.Children.Add(arrow);
         grid.Children.Add(repl);
         grid.Children.Add(del);
 
         var card = new Border
         {
-            Background = new SolidColorBrush(CardIdle), // не frozen — цвет анимируется на hover
+            Background = new SolidColorBrush(CardIdle),
             CornerRadius = new CornerRadius(10),
             Padding = new Thickness(10),
             Margin = new Thickness(0, 0, 0, 6),
             Child = grid,
-            Tag = abbr // для фокуса после добавления
+            Tag = trigger
         };
         card.MouseEnter += (_, _) => Paint(card, CardHover);
         card.MouseLeave += (_, _) => Paint(card, CardIdle);
@@ -387,9 +378,9 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
     private void AddRow()
     {
         if (_rowsPanel!.Children.Count == 1 && _rowsPanel.Children[0] is TextBlock)
-            _rowsPanel.Children.Clear(); // убрать empty-hint
+            _rowsPanel.Children.Clear();
 
-        var model = new AbbrRow();
+        var model = new ExpansionRule();
         _rows.Add(model);
         var card = BuildRow(model);
         _rowsPanel.Children.Add(card);
@@ -397,7 +388,7 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         ScheduleSave();
     }
 
-    private void RemoveRow(AbbrRow model, Border card)
+    private void RemoveRow(ExpansionRule model, Border card)
     {
         _rows.Remove(model);
         _rowsPanel!.Children.Remove(card);
@@ -417,10 +408,9 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         if (!_dirty || _rowsPanel == null) return;
         _dirty = false;
         _saveDebounce?.Stop();
-        _settings.Abbreviations = _rows
-            .Where(r => !string.IsNullOrWhiteSpace(r.Abbr))
-            .GroupBy(r => r.Abbr.Trim(), StringComparer.Ordinal)
-            .ToDictionary(g => g.Key, g => g.First().Replacement);
+        _settings.Rules = _rows
+            .Where(r => !string.IsNullOrWhiteSpace(r.TriggerPattern))
+            .ToList();
         SaveSettings(_settings);
         FlashSaved();
     }
@@ -428,7 +418,7 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
     private void FlashSaved()
     {
         if (_savedLabel == null) return;
-        _savedLabel.BeginAnimation(UIElement.OpacityProperty, null); // перезапуск с чистого состояния
+        _savedLabel.BeginAnimation(UIElement.OpacityProperty, null);
         _savedLabel.Opacity = 1;
         var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(700)) { BeginTime = TimeSpan.FromMilliseconds(1200) };
         _savedLabel.BeginAnimation(UIElement.OpacityProperty, fade);

@@ -1,4 +1,8 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Windows;
+using System.Windows.Threading;
 
 namespace JarvisUtils.Core;
 
@@ -6,20 +10,38 @@ public sealed class InputSimulator : IInputSimulator
 {
     private const ushort VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_CONTROL = 0x11, VK_C = 0x43, VK_V = 0x56;
 
+    /// <summary>
+    /// Вставляет текст через буфер обмена (Ctrl+V) вместо посимвольной юникод-печати —
+    /// быстрее и атомарно для приложения-получателя, что убирает гонки на длинных
+    /// многострочных заменах. Текущее содержимое буфера сохраняется перед вставкой и
+    /// восстанавливается после, чтобы не затирать то, что было скопировано у пользователя.
+    /// </summary>
     public void SendText(string text)
     {
-        var inputs = new List<WinApi.INPUT>();
-        foreach (var ch in text.Replace("\r\n", "\n").Replace('\r', '\n'))
+        IDataObject? backup = null;
+        try
         {
-            if (ch == '\n') { inputs.Add(KeyDown(VK_RETURN)); inputs.Add(KeyUp(VK_RETURN)); }
-            else if (ch == '\t') { inputs.Add(KeyDown(VK_TAB)); inputs.Add(KeyUp(VK_TAB)); }
-            else
-            {
-                inputs.Add(Unicode(ch, false));
-                inputs.Add(Unicode(ch, true));
-            }
+            backup = TryGetClipboardBackup();
         }
-        Send(inputs);
+        catch (Exception ex)
+        {
+            Log.Warn($"SendText: не удалось прочитать текущий буфер перед вставкой — {ex.Message}");
+        }
+
+        try
+        {
+            Clipboard.SetText(text);
+        }
+        catch (Exception ex)
+        {
+            // Буфер обмена бывает временно занят другим процессом в Windows — короткий ретрай.
+            Log.Warn($"SendText: Clipboard.SetText не удался, ретрай — {ex.Message}");
+            Thread.Sleep(30);
+            Clipboard.SetText(text);
+        }
+
+        SendCtrlV();
+        RestoreClipboardAfterDelay(backup);
     }
 
     public void SendBackspaces(int count)
@@ -34,6 +56,41 @@ public sealed class InputSimulator : IInputSimulator
 
     /// <summary>Выделение в целевом приложении остаётся активным, поэтому достаточно «напечатать» текст поверх него.</summary>
     public void ReplaceSelection(string text) => SendText(text);
+
+    // ── Буфер обмена: backup / restore ──
+
+    private static IDataObject? TryGetClipboardBackup()
+    {
+        // Оборачиваем в новый DataObject, чтобы снять независимую копию данных прямо
+        // сейчас — "живой" объект от Clipboard.GetDataObject() может стать недействительным
+        // после следующего SetText.
+        var current = Clipboard.GetDataObject();
+        return current != null ? new DataObject(current) : null;
+    }
+
+    private static void RestoreClipboardAfterDelay(IDataObject? backup)
+    {
+        if (backup == null) return;
+
+        // Пауза перед восстановлением — даём целевому приложению время реально забрать
+        // вставленный текст из буфера, прежде чем мы положим туда старое содержимое.
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            try
+            {
+                Clipboard.SetDataObject(backup, true);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"SendText: не удалось восстановить буфер обмена — {ex.Message}");
+            }
+        };
+        timer.Start();
+    }
+
+    // ── Низкоуровневые примитивы ──
 
     private static WinApi.INPUT Unicode(char ch, bool up) => new()
     {
