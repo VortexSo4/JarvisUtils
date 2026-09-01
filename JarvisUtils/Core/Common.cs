@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Media;
 
 namespace JarvisUtils.Core;
@@ -18,22 +21,61 @@ public static class AppPaths
 
 public static class Log
 {
-    private static readonly object Gate = new();
+    private const int MaxQueuedLines = 8192;
+
+    // Лог вызывается в том числе из коллбэков low-level хуков (catch-ветки
+    // HookManager, ретраи буфера). Раньше каждая запись делала синхронный
+    // File.AppendAllText с открытием файла — медленный диск/антивирус мог
+    // поставить UI-поток (а с ним и ввод всей системы) на секунды.
+    // Теперь Write() только ставит строку в очередь, пишет фоновый поток.
+    private static readonly ConcurrentQueue<string> _pending = new();
+    private static readonly AutoResetEvent _wake = new(false);
+
+    static Log()
+    {
+        var writer = new Thread(WriterLoop) { Name = "JarvisUtils.Log", IsBackground = true };
+        writer.Start();
+    }
+
     public static void Info(string m) => Write("INFO ", m);
     public static void Warn(string m) => Write("WARN ", m);
     public static void Error(string m) => Write("ERROR", m);
+
     private static void Write(string level, string message)
     {
         try
         {
-            lock (Gate)
-            {
-                Directory.CreateDirectory(AppPaths.DataDir);
-                File.AppendAllText(AppPaths.LogFile,
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}{Environment.NewLine}");
-            }
+            if (_pending.Count >= MaxQueuedLines) return; // переполнение — теряем строки, но не память
+            _pending.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}{Environment.NewLine}");
+            _wake.Set();
         }
         catch { /* логирование не должно ронять приложение */ }
+    }
+
+    private static void WriterLoop()
+    {
+        var batch = new StringBuilder(8192);
+        while (true)
+        {
+            _wake.WaitOne();
+            batch.Clear();
+            while (_pending.TryDequeue(out var line)) batch.Append(line);
+            if (batch.Length == 0) continue;
+            try
+            {
+                Directory.CreateDirectory(AppPaths.DataDir);
+                File.AppendAllText(AppPaths.LogFile, batch.ToString());
+            }
+            catch { /* логирование не должно ронять приложение */ }
+        }
+    }
+
+    /// <summary>Дождаться вывода накопленного (вызывать при выходе из приложения).</summary>
+    public static void Flush(int timeoutMs = 2000)
+    {
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (!_pending.IsEmpty && Environment.TickCount64 < deadline) Thread.Sleep(10);
+        Thread.Sleep(30); // даём дописать пакет, который уже забрали из очереди
     }
 }
 

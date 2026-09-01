@@ -2,6 +2,7 @@
 using System.Threading;
 using System.Windows;
 using JarvisUtils.Core;
+using JarvisUtils.Modules.Calculator;
 using JarvisUtils.Modules.CaseConverter;
 using JarvisUtils.Modules.ClipboardFavorites;
 using JarvisUtils.Modules.CodeMerger;
@@ -64,7 +65,8 @@ public partial class App : Application
             new TextExpanderModule(),
             new ClipboardFavoritesModule(),
             new ScreenshotOcrModule(),
-            new CodeMergerModule()
+            new CodeMergerModule(),
+            new CalculatorModule()
         ]);
 
         _tray = new TrayHost(services.TrayMenu, _runner);
@@ -80,6 +82,7 @@ public partial class App : Application
             _mutex?.ReleaseMutex();
         }
         catch { }
+        Log.Flush();
         base.OnExit(e);
     }
 }

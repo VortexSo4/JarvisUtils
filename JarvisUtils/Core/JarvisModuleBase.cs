@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace JarvisUtils.Core;
 
@@ -11,6 +12,8 @@ public abstract class JarvisModuleBase : IJarvisModule
     }
 
     public IJarvisServices Services { get; private set; } = null!;
+    
+    private static readonly object SettingsIoGate = new();
 
     public virtual string Name => GetType().Name.Replace("Module", "");
     public virtual string DisplayName => Name;
@@ -41,13 +44,24 @@ public abstract class JarvisModuleBase : IJarvisModule
         if (enabled) { HotkeysRegistered = true; RegisterHotkeys(); IsEnabled = true; OnEnabled(); }
         else { Services.Hotkeys.UnregisterAll(this); IsEnabled = false; OnDisabled(); }
 
-        try // персистим состояние модулей
+        // FIX: синхронная запись на диск из UI-потока (антивирус, просыпающийся
+        // HDD) давала паузы — причём в момент, когда на потоке висят хуки.
+        var name = Name;
+        var enabledNow = enabled;
+        var services = Services;
+        Task.Run(() =>
         {
-            var core = Services.Settings.Load<CoreState>("_core");
-            if (enabled) core.Disabled.Remove(Name); else core.Disabled.Add(Name);
-            Services.Settings.Save("_core", core);
-        }
-        catch { }
+            try
+            {
+                lock (SettingsIoGate)
+                {
+                    var core = services.Settings.Load<CoreState>("_core");
+                    if (enabledNow) core.Disabled.Remove(name); else core.Disabled.Add(name);
+                    services.Settings.Save("_core", core);
+                }
+            }
+            catch { }
+        });
     }
 
     /// <summary>Перерегистрация хоткеев после смены в настройках.</summary>
