@@ -10,6 +10,7 @@ using JarvisUtils.Modules.LayoutFixer;
 using JarvisUtils.Modules.PlainTextPaste;
 using JarvisUtils.Modules.ScreenshotOcr;
 using JarvisUtils.Modules.TextExpander;
+using JarvisUtils.Modules.Widgets;
 using JarvisUtils.UI.Tray;
 
 namespace JarvisUtils.App;
@@ -66,7 +67,8 @@ public partial class App : Application
             new ClipboardFavoritesModule(),
             new ScreenshotOcrModule(),
             new CodeMergerModule(),
-            new CalculatorModule()
+            new CalculatorModule(),
+            new WidgetsModule()
         ]);
 
         _tray = new TrayHost(services.TrayMenu, _runner);
