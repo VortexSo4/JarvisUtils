@@ -2,7 +2,6 @@
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using JarvisUtils.Core;
@@ -15,6 +14,9 @@ public sealed class WidgetsEditorWindow : Window
     private readonly WidgetModel _model;
     private readonly LiveDataProvider _data;
     private readonly Action _onChange;
+    private readonly Action<WidgetModel>? _onAddWidget;
+    private readonly Action<WidgetModel>? _onExport;
+    private readonly Action<WidgetModel>? _onImport;
 
     private readonly Canvas _previewCanvas;
     private readonly Border _previewHost;
@@ -27,20 +29,30 @@ public sealed class WidgetsEditorWindow : Window
 
     private WidgetElement? _selectedElement;
 
-    // drag/resize state for elements
     private Border? _draggingEl;
     private Point _dragOffset;
     private bool _isPanning;
     private Point _panStart;
     private Point _panOrigin;
 
-    private const double CanvasPadding = 400; // запас вокруг виджета, чтобы можно было таскать элементы за границы и панорамировать
+    private const double CanvasPadding = 400;
 
-    public WidgetsEditorWindow(WidgetModel model, LiveDataProvider data, Action onChange)
+    private TextBox? _xBox, _yBox, _wBox, _hBox;
+
+    public WidgetsEditorWindow(
+        WidgetModel model,
+        LiveDataProvider data,
+        Action onChange,
+        Action<WidgetModel>? onAddWidget = null,
+        Action<WidgetModel>? onExport = null,
+        Action<WidgetModel>? onImport = null)
     {
         _model = model;
         _data = data;
         _onChange = onChange;
+        _onAddWidget = onAddWidget;
+        _onExport = onExport;
+        _onImport = onImport;
 
         Resources.MergedDictionaries.Add(new ResourceDictionary
         {
@@ -57,11 +69,26 @@ public sealed class WidgetsEditorWindow : Window
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(320) });
 
-        // ═══ ЛЕВАЯ ПАНЕЛЬ (Элементы) ═══
+        // ═══ ЛЕВАЯ ПАНЕЛЬ ═══
         var leftPanel = new DockPanel { Margin = new Thickness(10) };
 
-        var elementsHeader = new TextBlock { Text = "ЭЛЕМЕНТЫ ВИДЖЕТА", Margin = new Thickness(0, 0, 0, 8), Foreground = JarvisTheme.ForegroundBrush(0.6), FontSize = 11 };
+        var elementsHeader = new TextBlock
+        {
+            Text = "ЭЛЕМЕНТЫ ВИДЖЕТА",
+            Margin = new Thickness(0, 0, 0, 8),
+            Foreground = JarvisTheme.ForegroundBrush(0.6),
+            FontSize = 11
+        };
         DockPanel.SetDock(elementsHeader, Dock.Top);
+
+        var addWidgetBtn = new Button
+        {
+            Content = "Добавить виджет",
+            Margin = new Thickness(0, 0, 0, 8),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        addWidgetBtn.Click += (_, _) => _onAddWidget?.Invoke(_model);
+        DockPanel.SetDock(addWidgetBtn, Dock.Top);
 
         var addRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
         DockPanel.SetDock(addRow, Dock.Bottom);
@@ -69,7 +96,6 @@ public sealed class WidgetsEditorWindow : Window
         addMenuBtn.Click += (_, _) => ShowAddElementMenu(addMenuBtn);
         addRow.Children.Add(addMenuBtn);
 
-        // ListBox теперь показывает el.ToString() (тип: текст), не полное имя класса
         _elementsList = new ListBox { Background = Brushes.Transparent, BorderThickness = new Thickness(0) };
         _elementsList.SelectionChanged += (s, e) =>
         {
@@ -80,12 +106,11 @@ public sealed class WidgetsEditorWindow : Window
         _elementsList.MouseRightButtonUp += ElementsList_MouseRightButtonUp;
 
         leftPanel.Children.Add(elementsHeader);
+        leftPanel.Children.Add(addWidgetBtn);
         leftPanel.Children.Add(addRow);
         leftPanel.Children.Add(_elementsList);
 
-        RefreshElementsList();
-
-        // ═══ ЦЕНТР (Холст с панорамированием + скролл + resize виджета) ═══
+        // ═══ ЦЕНТР ═══
         _previewCanvas = new Canvas
         {
             RenderTransform = _panTransform,
@@ -96,8 +121,8 @@ public sealed class WidgetsEditorWindow : Window
 
         _previewScroll = new ScrollViewer
         {
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
             Content = _previewCanvas,
             Background = new SolidColorBrush(Color.FromRgb(0x10, 0x12, 0x18)),
             CanContentScroll = false
@@ -110,13 +135,31 @@ public sealed class WidgetsEditorWindow : Window
             Child = _previewScroll
         };
 
-        // Панорамирование средней/правой кнопкой мыши (левая теперь свободна для выделения/drag элементов)
         _previewHost.MouseRightButtonDown += PreviewHost_PanDown;
         _previewHost.MouseMove += PreviewHost_MouseMove;
         _previewHost.MouseRightButtonUp += PreviewHost_PanUp;
         _previewHost.MouseWheel += PreviewHost_MouseWheel;
 
-        // ═══ ПРАВАЯ ПАНЕЛЬ — раздельные вкладки "Свойства" / "Скрипт" ═══
+        var centerDock = new DockPanel();
+        var bottomBar = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(10, 0, 10, 10),
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var exportBtn = new Button { Content = "Экспорт в буфер", Margin = new Thickness(0, 0, 10, 0) };
+        exportBtn.Click += (_, _) => _onExport?.Invoke(_model);
+        var importBtn = new Button { Content = "Импорт из буфера" };
+        importBtn.Click += (_, _) => _onImport?.Invoke(_model);
+
+        bottomBar.Children.Add(exportBtn);
+        bottomBar.Children.Add(importBtn);
+        DockPanel.SetDock(bottomBar, Dock.Bottom);
+
+        centerDock.Children.Add(bottomBar);
+        centerDock.Children.Add(_previewHost);
+
+        // ═══ ПРАВАЯ ПАНЕЛЬ ═══
         _rightTabs = new TabControl { Margin = new Thickness(10) };
 
         var propsTab = new TabItem { Header = "Свойства" };
@@ -125,7 +168,8 @@ public sealed class WidgetsEditorWindow : Window
         {
             Content = _propertyPanel,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Background = Brushes.Transparent
         };
         propsTab.Content = propScroll;
 
@@ -181,29 +225,25 @@ public sealed class WidgetsEditorWindow : Window
         _rightTabs.Items.Add(scriptTab);
 
         grid.Children.Add(leftPanel);
-        grid.Children.Add(_previewHost);
+        grid.Children.Add(centerDock);
         grid.Children.Add(_rightTabs);
 
         Grid.SetColumn(leftPanel, 0);
-        Grid.SetColumn(_previewHost, 1);
+        Grid.SetColumn(centerDock, 1);
         Grid.SetColumn(_rightTabs, 2);
 
         Content = grid;
 
-        // центрируем скролл на виджете при открытии
         Loaded += (_, _) =>
         {
             _previewScroll.ScrollToHorizontalOffset(CanvasPadding - 40);
             _previewScroll.ScrollToVerticalOffset(CanvasPadding - 40);
         };
 
+        RefreshElementsList();
         DrawPreview();
         UpdatePropertyPanel();
     }
-
-    // ─────────────────────────────────────────────────────────
-    // Список элементов
-    // ─────────────────────────────────────────────────────────
 
     private void RefreshElementsList()
     {
@@ -239,9 +279,39 @@ public sealed class WidgetsEditorWindow : Window
         _ => type.ToString()
     };
 
+    private static string TypeIdPrefix(WidgetElementType type) => type switch
+    {
+        WidgetElementType.Panel => "panel",
+        WidgetElementType.Text => "text",
+        WidgetElementType.Button => "btn",
+        WidgetElementType.Checkbox => "check",
+        WidgetElementType.Note => "note",
+        _ => "el"
+    };
+
+    /// <summary>Генерирует уникальный читаемый Id внутри виджета (btn_1, text_2, …).</summary>
+    private string MakeUniqueId(string baseId)
+    {
+        if (string.IsNullOrWhiteSpace(baseId)) baseId = "el";
+        baseId = baseId.Trim();
+        if (!_model.Elements.Any(e => e.Id == baseId)) return baseId;
+
+        int n = 2;
+        while (_model.Elements.Any(e => e.Id == baseId + "_" + n)) n++;
+        return baseId + "_" + n;
+    }
+
     private void AddElement(WidgetElementType type)
     {
-        var el = new WidgetElement { Type = type, Text = TypeLabel(type), Width = 100, Height = 30 };
+        var prefix = TypeIdPrefix(type);
+        var el = new WidgetElement
+        {
+            Type = type,
+            Text = TypeLabel(type),
+            Width = 100,
+            Height = 30,
+            Id = MakeUniqueId(prefix + "_" + (_model.Elements.Count + 1))
+        };
         _model.Elements.Add(el);
         _onChange?.Invoke();
         RefreshElementsList();
@@ -262,7 +332,8 @@ public sealed class WidgetsEditorWindow : Window
             Background = source.Background,
             Foreground = source.Foreground,
             FontSize = source.FontSize,
-            CornerRadius = source.CornerRadius
+            CornerRadius = source.CornerRadius,
+            Id = MakeUniqueId(source.Id + "_copy")
         };
         _model.Elements.Add(copy);
         _onChange?.Invoke();
@@ -284,10 +355,9 @@ public sealed class WidgetsEditorWindow : Window
     private void ElementsList_MouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
         if (_elementsList.SelectedItem is not WidgetElement el) return;
-        ShowElementContextMenu(el, e.GetPosition(_elementsList));
+        ShowElementContextMenu(el);
     }
 
-    // ПКМ по элементу на холсте ИЛИ в списке — попап с удалением/дублированием (пункт 7, кнопка "удалить выбранный" убрана — пункт 6)
     private void ShowElementContextMenu(WidgetElement el, Point? relativeTo = null)
     {
         var menu = new ContextMenu();
@@ -313,10 +383,6 @@ public sealed class WidgetsEditorWindow : Window
         menu.IsOpen = true;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Отрисовка холста
-    // ─────────────────────────────────────────────────────────
-
     private void DrawPreview()
     {
         _previewCanvas.Children.Clear();
@@ -333,7 +399,6 @@ public sealed class WidgetsEditorWindow : Window
         Canvas.SetTop(widgetBorder, CanvasPadding);
         _previewCanvas.Children.Add(widgetBorder);
 
-        // лёгкая сетка внутри границ виджета — как в реальном режиме редактирования
         DrawGrid();
 
         foreach (var el in _model.Elements)
@@ -347,7 +412,8 @@ public sealed class WidgetsEditorWindow : Window
                 BorderThickness = new Thickness(_selectedElement == el ? 2 : 1),
                 Cursor = Cursors.SizeAll,
                 Tag = el,
-                CornerRadius = new CornerRadius(el.CornerRadius)
+                CornerRadius = new CornerRadius(el.CornerRadius),
+                ClipToBounds = true
             };
             Canvas.SetLeft(elBorder, CanvasPadding + el.X);
             Canvas.SetTop(elBorder, CanvasPadding + el.Y);
@@ -355,7 +421,7 @@ public sealed class WidgetsEditorWindow : Window
             elBorder.MouseLeftButtonDown += Element_MouseLeftButtonDown;
             elBorder.MouseRightButtonDown += (s, e) =>
             {
-                e.Handled = true; // не даём холсту начать панорамирование/снятие выделения
+                e.Handled = true;
                 _selectedElement = el;
                 _elementsList.SelectedItem = el;
                 DrawPreview();
@@ -363,15 +429,55 @@ public sealed class WidgetsEditorWindow : Window
                 ShowElementContextMenu(el);
             };
 
-            var lbl = new TextBlock
+            UIElement child;
+            if (el.Type == WidgetElementType.Button)
             {
-                Text = el.Text,
-                Foreground = SafeColor(el.Foreground),
-                Margin = new Thickness(4),
-                IsHitTestVisible = false,
-                TextTrimming = TextTrimming.CharacterEllipsis
-            };
-            elBorder.Child = lbl;
+                child = new Button
+                {
+                    Content = el.Text,
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    Foreground = SafeColor(el.Foreground),
+                    FontSize = el.FontSize,
+                    IsHitTestVisible = false
+                };
+            }
+            else if (el.Type == WidgetElementType.Checkbox)
+            {
+                child = new CheckBox
+                {
+                    Content = el.Text,
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    Foreground = SafeColor(el.Foreground),
+                    FontSize = el.FontSize,
+                    IsHitTestVisible = false
+                };
+            }
+            else if (el.Type == WidgetElementType.Note)
+            {
+                child = new TextBox
+                {
+                    Text = el.Text,
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    Foreground = SafeColor(el.Foreground),
+                    FontSize = el.FontSize,
+                    IsHitTestVisible = false
+                };
+            }
+            else
+            {
+                child = new TextBlock
+                {
+                    Text = el.Text,
+                    Foreground = SafeColor(el.Foreground),
+                    Margin = new Thickness(4),
+                    IsHitTestVisible = false,
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                };
+            }
+            elBorder.Child = child;
 
             _previewCanvas.Children.Add(elBorder);
 
@@ -412,38 +518,61 @@ public sealed class WidgetsEditorWindow : Window
         catch { return new SolidColorBrush(Colors.Gray); }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Resize отдельного элемента (маленький "уголок" — не путать с resize виджета)
-    // ─────────────────────────────────────────────────────────
-
     private void AddResizeHandle(Border elBorder, WidgetElement el)
     {
-        var thumb = new Thumb
+        var knob = new Border
         {
-            Width = 10,
-            Height = 10,
+            Width = 12,
+            Height = 12,
+            CornerRadius = new CornerRadius(6),
+            Background = JarvisTheme.AccentBrush,
+            BorderBrush = JarvisTheme.Solid(JarvisTheme.Bg, 0.8),
+            BorderThickness = new Thickness(1),
             Cursor = Cursors.SizeNWSE,
-            Background = JarvisTheme.AccentBrush
+            Tag = el
         };
-        Canvas.SetLeft(thumb, CanvasPadding + el.X + el.Width - 5);
-        Canvas.SetTop(thumb, CanvasPadding + el.Y + el.Height - 5);
+        Canvas.SetLeft(knob, CanvasPadding + el.X + el.Width - 6);
+        Canvas.SetTop(knob, CanvasPadding + el.Y + el.Height - 6);
 
-        thumb.DragDelta += (s, e) =>
+        bool isResizing = false;
+        Point resizeStart = new();
+        double startW = 0, startH = 0;
+
+        knob.MouseLeftButtonDown += (s, e) =>
         {
-            el.Width = Math.Max(12, el.Width + e.HorizontalChange);
-            el.Height = Math.Max(12, el.Height + e.VerticalChange);
+            isResizing = true;
+            resizeStart = e.GetPosition(_previewCanvas);
+            startW = el.Width;
+            startH = el.Height;
+            knob.CaptureMouse();
+            e.Handled = true;
+        };
+        knob.MouseMove += (s, e) =>
+        {
+            if (!isResizing || e.LeftButton != MouseButtonState.Pressed) return;
+            var p = e.GetPosition(_previewCanvas);
+            el.Width = Math.Max(12, startW + (p.X - resizeStart.X));
+            el.Height = Math.Max(12, startH + (p.Y - resizeStart.Y));
+
+            elBorder.Width = el.Width;
+            elBorder.Height = el.Height;
+            Canvas.SetLeft(knob, CanvasPadding + el.X + el.Width - 6);
+            Canvas.SetTop(knob, CanvasPadding + el.Y + el.Height - 6);
+
             _onChange?.Invoke();
+            UpdatePositionFieldsOnly();
+            e.Handled = true;
+        };
+        knob.MouseLeftButtonUp += (s, e) =>
+        {
+            isResizing = false;
+            knob.ReleaseMouseCapture();
             DrawPreview();
-            UpdatePropertyPanel();
+            e.Handled = true;
         };
 
-        _previewCanvas.Children.Add(thumb);
+        _previewCanvas.Children.Add(knob);
     }
-
-    // ─────────────────────────────────────────────────────────
-    // Панорамирование холста (теперь ПКМ+drag, чтобы не конфликтовать с выделением/drag элементов;
-    // плюс ScrollViewer уже даёт нормальный скролл колесом/полосами — пункт 3)
-    // ─────────────────────────────────────────────────────────
 
     private void PreviewHost_PanDown(object sender, MouseButtonEventArgs e)
     {
@@ -472,19 +601,12 @@ public sealed class WidgetsEditorWindow : Window
 
     private void PreviewHost_MouseWheel(object sender, MouseWheelEventArgs e)
     {
-        // обычный вертикальный скролл колесом; Shift+колесо — горизонтальный
         if (Keyboard.Modifiers == ModifierKeys.Shift)
         {
             _previewScroll.ScrollToHorizontalOffset(_previewScroll.HorizontalOffset - e.Delta);
             e.Handled = true;
         }
-        // иначе — пусть ScrollViewer обработает сам (вертикальный скролл по умолчанию)
     }
-
-    // ─────────────────────────────────────────────────────────
-    // Drag элементов — теперь работает за пределами исходных размеров виджета
-    // (ограничение убрано; можно вытащить элемент хоть за край, resize'ится нормально)
-    // ─────────────────────────────────────────────────────────
 
     private void Element_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -492,8 +614,20 @@ public sealed class WidgetsEditorWindow : Window
 
         _selectedElement = el;
         _elementsList.SelectedItem = el;
-        DrawPreview();
         UpdatePropertyPanel();
+
+        foreach (var child in _previewCanvas.Children.OfType<Border>())
+        {
+            if (child.Tag is WidgetElement we)
+            {
+                bool sel = we == _selectedElement;
+                child.BorderBrush = sel ? JarvisTheme.AccentBrush : JarvisTheme.Solid(Colors.White, 0x22);
+                child.BorderThickness = new Thickness(sel ? 2 : 1);
+            }
+        }
+
+        RemoveResizeHandles();
+        AddResizeHandle(b, el);
 
         _draggingEl = b;
         _dragOffset = e.GetPosition(b);
@@ -501,6 +635,15 @@ public sealed class WidgetsEditorWindow : Window
         b.MouseMove += DraggingElement_MouseMove;
         b.MouseLeftButtonUp += DraggingElement_MouseLeftButtonUp;
         e.Handled = true;
+    }
+
+    private void RemoveResizeHandles()
+    {
+        for (int i = _previewCanvas.Children.Count - 1; i >= 0; i--)
+        {
+            if (_previewCanvas.Children[i] is Border b && b.Width == 12 && b.Height == 12)
+                _previewCanvas.Children.RemoveAt(i);
+        }
     }
 
     private void DraggingElement_MouseMove(object sender, MouseEventArgs e)
@@ -513,6 +656,15 @@ public sealed class WidgetsEditorWindow : Window
 
         Canvas.SetLeft(_draggingEl, CanvasPadding + _selectedElement.X);
         Canvas.SetTop(_draggingEl, CanvasPadding + _selectedElement.Y);
+
+        foreach (var child in _previewCanvas.Children.OfType<Border>())
+        {
+            if (child.Width == 12 && child.Height == 12)
+            {
+                Canvas.SetLeft(child, CanvasPadding + _selectedElement.X + _selectedElement.Width - 6);
+                Canvas.SetTop(child, CanvasPadding + _selectedElement.Y + _selectedElement.Height - 6);
+            }
+        }
 
         UpdatePositionFieldsOnly();
         _onChange?.Invoke();
@@ -527,30 +679,34 @@ public sealed class WidgetsEditorWindow : Window
             b.ReleaseMouseCapture();
         }
         _draggingEl = null;
-        DrawPreview(); // перерисуем, чтобы ручка resize встала на новое место
+        DrawPreview();
     }
-
-    // ─────────────────────────────────────────────────────────
-    // Панель свойств (пункт 2: разделена вкладками от скрипта;
-    // раскладка "имя слева — поле справа" в одну строку через Grid)
-    // ─────────────────────────────────────────────────────────
-
-    private TextBox? _xBox, _yBox;
 
     private void UpdatePropertyPanel()
     {
         _propertyPanel.Children.Clear();
-        _xBox = _yBox = null;
+        _xBox = _yBox = _wBox = _hBox = null;
 
         if (_selectedElement == null)
         {
-            _propertyPanel.Children.Add(new TextBlock { Text = "Выберите элемент слева или на холсте", Foreground = JarvisTheme.ForegroundBrush(0.4), TextWrapping = TextWrapping.Wrap });
+            _propertyPanel.Children.Add(new TextBlock
+            {
+                Text = "Выберите элемент слева или на холсте",
+                Foreground = JarvisTheme.ForegroundBrush(0.4),
+                TextWrapping = TextWrapping.Wrap
+            });
             return;
         }
 
         var el = _selectedElement;
 
-        _propertyPanel.Children.Add(new TextBlock { Text = "СВОЙСТВА ЭЛЕМЕНТА", Foreground = JarvisTheme.ForegroundBrush(0.6), FontSize = 11, Margin = new Thickness(0, 0, 0, 10) });
+        _propertyPanel.Children.Add(new TextBlock
+        {
+            Text = "СВОЙСТВА ЭЛЕМЕНТА",
+            Foreground = JarvisTheme.ForegroundBrush(0.6),
+            FontSize = 11,
+            Margin = new Thickness(0, 0, 0, 10)
+        });
 
         TextBox AddRow(string label, string value, Action<string> onApply)
         {
@@ -568,8 +724,8 @@ public sealed class WidgetsEditorWindow : Window
             var tb = new TextBox { Text = value };
             tb.TextChanged += (s, e) =>
             {
-                try { onApply(tb.Text); _onChange?.Invoke(); DrawPreview(); }
-                catch { /* пользователь ещё печатает — игнорируем частично невалидный ввод */ }
+                try { onApply(tb.Text); _onChange?.Invoke(); DrawPreview(); RefreshElementsList(); }
+                catch { }
             };
 
             Grid.SetColumn(lbl, 0);
@@ -580,21 +736,33 @@ public sealed class WidgetsEditorWindow : Window
             return tb;
         }
 
+        // Id — первым, с проверкой уникальности
+        AddRow("Id", el.Id, v =>
+        {
+            v = (v ?? "").Trim();
+            if (string.IsNullOrEmpty(v)) return;
+            if (_model.Elements.Any(e => e != el && e.Id == v)) return; // занято — игнорируем
+            el.Id = v;
+        });
+
         _xBox = AddRow("X", el.X.ToString("0"), v => el.X = double.Parse(v));
         _yBox = AddRow("Y", el.Y.ToString("0"), v => el.Y = double.Parse(v));
-        AddRow("Ширина", el.Width.ToString("0"), v => el.Width = double.Parse(v));
-        AddRow("Высота", el.Height.ToString("0"), v => el.Height = double.Parse(v));
+        _wBox = AddRow("Ширина", el.Width.ToString("0"), v => el.Width = double.Parse(v));
+        _hBox = AddRow("Высота", el.Height.ToString("0"), v => el.Height = double.Parse(v));
         AddRow("Скругление", el.CornerRadius.ToString("0"), v => el.CornerRadius = double.Parse(v));
         AddRow("Текст / Содержание", el.Text, v => el.Text = v);
         AddRow("Размер шрифта", el.FontSize.ToString("0"), v => el.FontSize = double.Parse(v));
 
-        // Источник данных — теперь стилизованный ComboBox (пункт 8: стиль подтягивается из JarvisStyles.xaml,
-        // добавь туда Style TargetType="ComboBox" и "ComboBoxItem" по образцу ListBoxItem выше — своего стиля
-        // для ComboBox в присланном ResourceDictionary нет, нужен либо файл с ним, либо добавлю ниже сам)
         var bindRow = new Grid { Margin = new Thickness(0, 4, 0, 8) };
         bindRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(90) });
         bindRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var bindLbl = new TextBlock { Text = "Источник", Foreground = JarvisTheme.ForegroundBrush(0.8), FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+        var bindLbl = new TextBlock
+        {
+            Text = "Источник",
+            Foreground = JarvisTheme.ForegroundBrush(0.8),
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center
+        };
         var bindCombo = new ComboBox { ItemsSource = new[] { "Нет", "Time", "CPU", "RAM" } };
         bindCombo.SelectedItem = string.IsNullOrEmpty(el.Binding) ? "Нет" : el.Binding;
         bindCombo.SelectionChanged += (s, e) =>
@@ -623,11 +791,10 @@ public sealed class WidgetsEditorWindow : Window
         if (_selectedElement == null) return;
         if (_xBox != null) _xBox.Text = _selectedElement.X.ToString("0");
         if (_yBox != null) _yBox.Text = _selectedElement.Y.ToString("0");
+        if (_wBox != null) _wBox.Text = _selectedElement.Width.ToString("0");
+        if (_hBox != null) _hBox.Text = _selectedElement.Height.ToString("0");
     }
 
-    // Пробная компиляция скрипта прямо в редакторе — та же логика, что в WidgetWindow.CompileScript(),
-    // но без создания живого Script<object> в поле окна: тут нужен только текст ошибки для UI.
-    // Возвращает null при успехе, иначе текст ошибки компиляции.
     private static string? TryCompileScript(string source)
     {
         if (string.IsNullOrWhiteSpace(source)) return null;

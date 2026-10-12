@@ -7,7 +7,7 @@ public enum WidgetElementType { Panel, Text, Button, Checkbox, Note }
 
 public sealed class WidgetElement
 {
-    public override string ToString() => $"{Type}: {(Text.Length > 20 ? Text[..20] + "…" : Text)}";
+    public override string ToString() => $"{Id} · {Type}: {(Text.Length > 20 ? Text[..20] + "…" : Text)}";
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public WidgetElementType Type { get; set; } = WidgetElementType.Text;
     public double X { get; set; } = 10;
