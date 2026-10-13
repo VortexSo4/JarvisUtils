@@ -3,3 +3,6 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+# сборка релизов (build/release.ps1)
+publish/
+Releases/

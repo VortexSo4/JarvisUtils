@@ -1,0 +1,29 @@
+# Релиз по тегу: git tag v1.0.1 && git push origin v1.0.1
+# Собирает приложение, упаковывает установщик и пакеты обновления (Velopack)
+# и публикует GitHub Release — установленные копии подхватят его при следующем запуске.
+name: release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write # создать релиз и загрузить файлы
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Version from tag
+        shell: pwsh
+        run: echo "VERSION=$('${{ github.ref_name }}'.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: Build and publish release
+        shell: pwsh
+        run: ./build/release.ps1 -Version $env:VERSION -Upload -Token ${{ secrets.GITHUB_TOKEN }}

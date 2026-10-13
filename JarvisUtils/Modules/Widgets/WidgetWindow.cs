@@ -20,7 +20,7 @@ namespace JarvisUtils.Modules.Widgets;
 /// </summary>
 public sealed class WidgetWindow : Window
 {
-    private const double SnapDistance = 6;  // DIP: лёгкое прилипание, не магнит
+    private const double SnapDistance = 10; // DIP: насколько близко к краю/соседу нужно отпустить, чтобы прилипло
     private const double SnapGap = 8;  // зазор между прилипшими виджетами, DIP
     private const double GripSize = 6;
 
@@ -212,22 +212,29 @@ public sealed class WidgetWindow : Window
             }
             case WM_MOVING:
             {
+                // окно идёт строго за мышью; куда оно встанет после отпускания — показывает рамка
                 var rect = Marshal.PtrToStructure<RECT>(lParam);
-                SnapMove(ref rect);
-                Marshal.StructureToPtr(rect, lParam, false);
-                handled = true;
-                return (IntPtr)1;
+                var snapped = rect;
+                SnapMove(ref snapped);
+                UpdatePendingSnap(rect, snapped);
+                break;
             }
             case WM_SIZING:
             {
+                // ограничения (минимум, пропорции картинки) — сразу; прилипание — после отпускания
+                int edge = wParam.ToInt32();
                 var rect = Marshal.PtrToStructure<RECT>(lParam);
-                AdjustSizing(ref rect, wParam.ToInt32());
+                ConstrainSize(ref rect, edge);
                 Marshal.StructureToPtr(rect, lParam, false);
+                var snapped = rect;
+                SnapEdges(ref snapped, edge);
+                ConstrainSize(ref snapped, edge);
+                UpdatePendingSnap(rect, snapped);
                 handled = true;
                 return (IntPtr)1;
             }
             case WM_EXITSIZEMOVE:
-                SyncGeometry();
+                CommitPendingSnap();
                 break;
             case WM_ACTIVATE when (wParam.ToInt32() & 0xFFFF) != 0:
                 // lParam — окно, у которого забрали фокус: на Esc вернём его туда
@@ -311,19 +318,21 @@ public sealed class WidgetWindow : Window
         rect.Top += dy; rect.Bottom += dy;
     }
 
-    private void AdjustSizing(ref RECT rect, int edge)
+    private void SnapEdges(ref RECT rect, int edge)
     {
+        if (SnapDisabled) return;
         bool left = edge is 1 or 4 or 7, right = edge is 2 or 5 or 8, top = edge is 3 or 4 or 5, bottom = edge is 6 or 7 or 8;
-        if (!SnapDisabled)
-        {
-            var t = SnapTargets(rect);
-            int threshold = (int)(SnapDistance * DpiUtil.Scale);
-            if (left) rect.Left += Delta(rect.Left, t.Left, threshold) ?? 0;
-            if (right) rect.Right += Delta(rect.Right, t.Right, threshold) ?? 0;
-            if (top) rect.Top += Delta(rect.Top, t.Top, threshold) ?? 0;
-            if (bottom) rect.Bottom += Delta(rect.Bottom, t.Bottom, threshold) ?? 0;
-        }
+        var t = SnapTargets(rect);
+        int threshold = (int)(SnapDistance * DpiUtil.Scale);
+        if (left) rect.Left += Delta(rect.Left, t.Left, threshold) ?? 0;
+        if (right) rect.Right += Delta(rect.Right, t.Right, threshold) ?? 0;
+        if (top) rect.Top += Delta(rect.Top, t.Top, threshold) ?? 0;
+        if (bottom) rect.Bottom += Delta(rect.Bottom, t.Bottom, threshold) ?? 0;
+    }
 
+    private void ConstrainSize(ref RECT rect, int edge)
+    {
+        bool left = edge is 1 or 4 or 7, right = edge is 2 or 5 or 8, top = edge is 3 or 4 or 5;
         int minW = (int)(MinWidth * DpiUtil.Scale), minH = (int)(MinHeight * DpiUtil.Scale);
         if (_content?.AspectRatio is double aspect && aspect > 0)
         {
@@ -336,6 +345,49 @@ public sealed class WidgetWindow : Window
         }
         if (rect.Right - rect.Left < minW) { if (left) rect.Left = rect.Right - minW; else rect.Right = rect.Left + minW; }
         if (rect.Bottom - rect.Top < minH) { if (top) rect.Top = rect.Bottom - minH; else rect.Bottom = rect.Top + minH; }
+    }
+
+    // ── прилипание «постфактум»: рамка-превью во время движения, доводка после отпускания ──
+
+    private RECT? _pendingSnap;
+
+    private void UpdatePendingSnap(RECT actual, RECT snapped)
+    {
+        bool differs = actual.Left != snapped.Left || actual.Top != snapped.Top || actual.Right != snapped.Right || actual.Bottom != snapped.Bottom;
+        _pendingSnap = differs ? snapped : null;
+        if (differs) SnapPreview.ShowAt(snapped.Left, snapped.Top, snapped.Right - snapped.Left, snapped.Bottom - snapped.Top);
+        else SnapPreview.HideNow();
+    }
+
+    private void CommitPendingSnap()
+    {
+        SnapPreview.HideNow();
+        if (_pendingSnap is not RECT target || SnapDisabled)
+        {
+            _pendingSnap = null;
+            SyncGeometry();
+            return;
+        }
+        _pendingSnap = null;
+        GetWindowRect(_hwnd, out var from);
+
+        // короткая доводка с замедлением — видно, куда «прилип» виджет
+        var started = DateTime.Now;
+        const double durationMs = 120;
+        var timer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(10) };
+        timer.Tick += (_, _) =>
+        {
+            double k = Math.Min(1, (DateTime.Now - started).TotalMilliseconds / durationMs);
+            double e = 1 - Math.Pow(1 - k, 3);
+            int Lerp(int a, int b) => (int)Math.Round(a + (b - a) * e);
+            int l = Lerp(from.Left, target.Left), t = Lerp(from.Top, target.Top);
+            int w = Lerp(from.Right - from.Left, target.Right - target.Left), h = Lerp(from.Bottom - from.Top, target.Bottom - target.Top);
+            SetWindowPos(_hwnd, IntPtr.Zero, l, t, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (k < 1) return;
+            timer.Stop();
+            SyncGeometry();
+        };
+        timer.Start();
     }
 
     /// <summary>Shift при перетаскивании/ресайзе — свободное движение без прилипания.</summary>

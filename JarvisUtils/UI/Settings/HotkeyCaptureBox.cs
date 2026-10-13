@@ -22,6 +22,8 @@ public sealed class HotkeyCaptureBox : TextBox
 
     public event Action<string?>? GestureChanged;
 
+    private string? _gesture; // хранимый жест («Ctrl+Alt+OemOpenBrackets»); в поле — читаемый вид («Ctrl+Alt+[»)
+
     public HotkeyCaptureBox(string? initialGesture)
     {
         SetResourceReference(StyleProperty, typeof(TextBox));
@@ -30,7 +32,7 @@ public sealed class HotkeyCaptureBox : TextBox
         IsUndoEnabled = false;
         TextAlignment = TextAlignment.Center;
         FontFamily = new FontFamily("Consolas");
-        Text = string.IsNullOrWhiteSpace(initialGesture) ? "— не задано —" : initialGesture;
+        Show(initialGesture);
         CaretBrush = Brushes.Transparent;
         Cursor = Cursors.Hand;
         Background = NormalBg;
@@ -100,7 +102,7 @@ public sealed class HotkeyCaptureBox : TextBox
             ToolTip = error;
             return;
         }
-        bool bare = Text != "— не задано —" && HotkeyGesture.Parse(Text).Mods == Modifiers.None;
+        bool bare = !string.IsNullOrWhiteSpace(_gesture) && HotkeyGesture.Parse(_gesture).Mods == Modifiers.None;
         Background = bare ? WarnBg : NormalBg;
         ToolTip = bare
             ? "Без модификаторов клавиша перехватывается глобально: набрать её в любом приложении будет нельзя."
@@ -108,12 +110,17 @@ public sealed class HotkeyCaptureBox : TextBox
     }
 
     /// <summary>Вернуть отображаемый жест без события (откат конфликтной попытки).</summary>
-    public void RevertTo(string? gesture) =>
-        Text = string.IsNullOrWhiteSpace(gesture) ? "— не задано —" : gesture;
+    public void RevertTo(string? gesture) => Show(gesture);
+
+    private void Show(string? gesture)
+    {
+        _gesture = string.IsNullOrWhiteSpace(gesture) ? null : gesture;
+        Text = _gesture == null ? "— не задано —" : HotkeyGesture.Display(_gesture);
+    }
 
     private void SetGesture(string? gesture)
     {
-        Text = string.IsNullOrWhiteSpace(gesture) ? "— не задано —" : gesture;
+        Show(gesture);
         SetFeedback(null);
         GestureChanged?.Invoke(gesture);
     }

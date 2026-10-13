@@ -37,6 +37,43 @@ public static class HotkeyGesture
         return (mods, key);
     }
 
+    /// <summary>Жест для показа человеку: «Ctrl+Alt+OemOpenBrackets» → «Ctrl+Alt+[».</summary>
+    public static string Display(string gesture)
+    {
+        var parts = gesture.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        for (int i = 0; i < parts.Length; i++)
+            if (Enum.TryParse<Key>(parts[i], true, out var key) && !IsModifierName(parts[i]))
+                parts[i] = KeyName(key);
+        return string.Join("+", parts);
+    }
+
+    private static bool IsModifierName(string part) =>
+        part.ToLowerInvariant() is "ctrl" or "control" or "alt" or "shift" or "win" or "meta";
+
+    private static string KeyName(Key key) => key switch
+    {
+        >= Key.D0 and <= Key.D9 => ((int)(key - Key.D0)).ToString(),
+        >= Key.NumPad0 and <= Key.NumPad9 => "Num" + (int)(key - Key.NumPad0),
+        Key.OemOpenBrackets => "[",
+        Key.OemCloseBrackets => "]",
+        Key.OemPlus => "=",
+        Key.OemMinus => "-",
+        Key.OemComma => ",",
+        Key.OemPeriod => ".",
+        Key.OemQuestion => "/",
+        Key.OemSemicolon => ";",
+        Key.OemQuotes => "'",
+        Key.OemPipe => "\\",
+        Key.OemTilde => "`",
+        Key.Space => "Пробел",
+        Key.Return => "Enter",
+        Key.Escape => "Esc",
+        Key.Back => "Backspace",
+        Key.PageUp => "PgUp",
+        Key.Next => "PgDn",
+        _ => key.ToString()
+    };
+
     public static string Format(Modifiers mods, Key key)
     {
         var parts = new List<string>(5);

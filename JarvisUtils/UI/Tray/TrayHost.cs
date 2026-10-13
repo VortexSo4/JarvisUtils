@@ -12,7 +12,7 @@ public sealed class TrayHost : IDisposable
     private readonly ITrayMenuBuilder _trayMenu; // действия модулей (тумблеры модулей — в настройках, не в трее)
     private readonly ModuleRunner _runner;
     private readonly ContextMenuStrip _menu;
-    private readonly IntPtr _iconHandle;
+    private readonly Icon _icon;
     private SettingsWindow? _settingsWindow;
 
     public TrayHost(ITrayMenuBuilder trayMenu, ModuleRunner runner)
@@ -20,8 +20,8 @@ public sealed class TrayHost : IDisposable
         _trayMenu = trayMenu;
         _runner = runner;
 
-        (_iconHandle, var icon) = CreateIcon();
-        _notifyIcon = new NotifyIcon { Icon = icon, Text = "JarvisUtils", Visible = true };
+        _icon = LoadIcon();
+        _notifyIcon = new NotifyIcon { Icon = _icon, Text = "JarvisUtils", Visible = true };
 
         // ── Меню: только "Выход" ──
         _menu = new ContextMenuStrip
@@ -68,26 +68,12 @@ public sealed class TrayHost : IDisposable
         _menu.Items.Add(exit);
     }
 
-    private static (IntPtr, Icon) CreateIcon()
+    /// <summary>Та же иконка, что у exe и окон (App/JarvisUtils.ico), в размере для трея.</summary>
+    private static Icon LoadIcon()
     {
-        using var bmp = new Bitmap(32, 32);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using var path = new System.Drawing.Drawing2D.GraphicsPath();
-            path.AddArc(2, 2, 8, 8, 180, 90);
-            path.AddArc(22, 2, 8, 8, 270, 90);
-            path.AddArc(22, 22, 8, 8, 0, 90);
-            path.AddArc(2, 22, 8, 8, 90, 90);
-            path.CloseFigure();
-            using (var bg = new SolidBrush(Color.FromArgb(255, 22, 24, 32))) g.FillPath(bg, path);
-            using (var pen = new Pen(Color.FromArgb(255, 0, 210, 255), 2f)) g.DrawPath(pen, path);
-            using var fg = new SolidBrush(Color.FromArgb(255, 0, 210, 255));
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-            g.DrawString("J", new Font("Segoe UI", 18f, FontStyle.Bold), fg, new RectangleF(0, 0, 32, 32), fmt);
-        }
-        IntPtr handle = bmp.GetHicon();
-        return (handle, Icon.FromHandle(handle));
+        var info = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/JarvisUtils;component/App/JarvisUtils.ico"));
+        using var stream = info!.Stream;
+        return new Icon(stream, SystemInformation.SmallIconSize);
     }
 
     public void OpenSettings()
@@ -105,7 +91,7 @@ public sealed class TrayHost : IDisposable
     {
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
-        if (_iconHandle != IntPtr.Zero) WinApi.DestroyIcon(_iconHandle);
+        _icon.Dispose();
     }
 
     private sealed class DarkRenderer() : ToolStripProfessionalRenderer(new DarkColors())

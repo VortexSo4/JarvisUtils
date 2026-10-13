@@ -4,7 +4,7 @@
         Title="JarvisUtils — настройки"
         Width="900" Height="600" MinWidth="740" MinHeight="440"
         WindowStartupLocation="CenterScreen"
-        Background="#FF14161D" FontFamily="Segoe UI">
+        Background="#FF14161D" Foreground="#FFE8EAEE" FontFamily="Segoe UI">
     <Window.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>

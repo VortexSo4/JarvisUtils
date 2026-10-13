@@ -79,6 +79,8 @@ public partial class App : Application
         ]);
 
         _tray = new TrayHost(services.TrayMenu, _runner);
+
+        _ = AppUpdater.CheckOnStartupAsync(); // только при запуске: новый релиз на GitHub → предложить перезапуск
     }
 
     protected override void OnExit(ExitEventArgs e)

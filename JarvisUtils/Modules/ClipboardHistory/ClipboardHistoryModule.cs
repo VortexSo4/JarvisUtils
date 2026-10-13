@@ -358,9 +358,9 @@ public sealed class ClipboardHistoryModule : JarvisModuleBase, IHotkeyConfigurab
 
         var clear = new Button { Content = FluentIcons.WithLabel(FluentIcons.Delete, "Очистить историю") };
         clear.Click += (_, _) => Clear(clear, keepFavorites: true);
-        var clearAll = new Button { Content = FluentIcons.WithLabel(FluentIcons.Warning, "Удалить всё, включая избранное"), Margin = new Thickness(8, 0, 0, 0) };
+        var clearAll = new Button { Content = FluentIcons.WithLabel(FluentIcons.Warning, "Удалить всё, включая избранное") };
         clearAll.Click += (_, _) => Clear(clearAll, keepFavorites: false);
-        var open = new Button { Content = FluentIcons.WithLabel(FluentIcons.Folder, "Открыть папку"), Margin = new Thickness(8, 0, 0, 0) };
+        var open = new Button { Content = FluentIcons.WithLabel(FluentIcons.Folder, "Открыть папку") };
         open.Click += (_, _) =>
         {
             try
@@ -370,10 +370,13 @@ public sealed class ClipboardHistoryModule : JarvisModuleBase, IHotkeyConfigurab
             }
             catch (Exception ex) { Log.Error($"история буфера: открыть папку: {ex.Message}"); }
         };
+        // отступ справа и снизу у каждой: при переносе строки кнопки не слипаются
         var buttons = new WrapPanel();
-        buttons.Children.Add(clear);
-        buttons.Children.Add(clearAll);
-        buttons.Children.Add(open);
+        foreach (var b in new[] { clear, clearAll, open })
+        {
+            b.Margin = new Thickness(0, 0, 8, 8);
+            buttons.Children.Add(b);
+        }
         root.Children.Add(buttons);
 
         if (_settings.LegacyFavoritesImported && File.Exists(LegacyIndexFile))
