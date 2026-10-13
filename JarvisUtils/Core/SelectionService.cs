@@ -1,14 +1,14 @@
 ﻿using System;
 using System.Linq;
 using System.Threading.Tasks;
-using System.Windows;
 using System.Windows.Automation;
-using SysClipboard = System.Windows.Clipboard;
 
 namespace JarvisUtils.Core;
 
 public sealed class SelectionService(IInputSimulator input) : ISelectionService
 {
+    private const int CaptureTimeoutMs = 3000;
+
     /// <summary>
     /// Сначала UI Automation (не трогает буфер), затем Ctrl+C с backup/restore.
     /// Метод async: во время ожидания нужно прокачивать очередь сообщений, иначе
@@ -42,29 +42,27 @@ public sealed class SelectionService(IInputSimulator input) : ISelectionService
 
     private async Task<string?> ViaClipboardAsync()
     {
-        IDataObject? backup = null;
-        SafeClipboard(() => backup = SysClipboard.GetDataObject());
-        SafeClipboard(SysClipboard.Clear);
+        // Снимок — ДО Ctrl+C (после копирования прежнее содержимое уже не вернуть).
+        // Ждём асинхронно: UI-поток с хуками продолжает качать сообщения.
+        var backup = await StaClipboard.RunAsync(NativeClipboard.Capture, CaptureTimeoutMs);
+        uint sequence = NativeClipboard.SequenceNumber;
 
         input.SendCtrlC();
 
         string? text = null;
-        for (int i = 0; i < 15; i++)
+        bool changed = false;
+        for (int i = 0; i < 15 && text == null; i++)
         {
             await Task.Delay(20); // приложение обрабатывает Ctrl+C
-            bool has = false;
-            SafeClipboard(() => has = SysClipboard.ContainsText());
-            if (has) { SafeClipboard(() => text = SysClipboard.GetText()); break; }
+            if (NativeClipboard.SequenceNumber == sequence) continue;
+            changed = true;
+            text = await StaClipboard.RunAsync(NativeClipboard.GetText, 500);
         }
 
-        await Task.Delay(60); // дать дочитать буфер перед восстановлением
-        SafeClipboard(() =>
-        {
-            if (backup != null) SysClipboard.SetDataObject(backup, true);
-            else SysClipboard.Clear();
-        });
+        // Буфер не менялся (выделения не было) — восстанавливать нечего.
+        // Post: идёт в ту же очередь, что и последующая вставка, — порядок сохранится.
+        if (changed && backup != null)
+            StaClipboard.Post(() => NativeClipboard.Restore(backup));
         return string.IsNullOrWhiteSpace(text) ? null : text;
     }
-
-    private static void SafeClipboard(Action a) { try { a(); } catch (Exception ex) { Log.Warn($"clipboard: {ex.Message}"); } }
 }

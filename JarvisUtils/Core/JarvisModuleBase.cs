@@ -17,6 +17,8 @@ public abstract class JarvisModuleBase : IJarvisModule
 
     public virtual string Name => GetType().Name.Replace("Module", "");
     public virtual string DisplayName => Name;
+    /// <summary>Глиф Segoe Fluent Icons для сайдбара настроек (константы — в FluentIcons).</summary>
+    public virtual string Icon => FluentIcons.Puzzle;
     public bool IsEnabled { get; private set; }
     public bool Suspended { get; set; }
 

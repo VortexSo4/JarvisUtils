@@ -1,17 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using JarvisUtils.Core;
 
 namespace JarvisUtils.Modules.ScreenshotOcr;
 
-public sealed class ScreenshotOcrModule : JarvisModuleBase, IHotkeyConfigurable
+public sealed class ScreenshotOcrModule : JarvisModuleBase, IHotkeyConfigurable, IQuickActions
 {
     public sealed class Settings
     {
@@ -21,6 +18,12 @@ public sealed class ScreenshotOcrModule : JarvisModuleBase, IHotkeyConfigurable
     private Settings _settings = null!;
 
     public override string DisplayName => "Скриншот OCR";
+    public override string Icon => FluentIcons.Screenshot;
+
+    public IReadOnlyList<QuickAction> QuickActions =>
+    [
+        new("Распознать текст", FluentIcons.Language, StartCapture)
+    ];
 
     protected override void RegisterHotkeys()
     {
@@ -34,38 +37,13 @@ public sealed class ScreenshotOcrModule : JarvisModuleBase, IHotkeyConfigurable
             g => { _settings.Hotkey = g; SaveSettings(_settings); RestartHotkeys(); })
     ];
 
-    private void StartCapture()
-    {
-        var bounds = WinApi.VirtualScreenRect();
-        BitmapSource source;
-        using (var bmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb))
-        {
-            using (var g = Graphics.FromImage(bmp))
-            {
-                g.CopyFromScreen(bounds.X, bounds.Y, 0, 0,
-                    new System.Drawing.Size(bounds.Width, bounds.Height), CopyPixelOperation.SourceCopy);
-            }
-            source = ToSource(bmp);
-        }
+    private void StartCapture() =>
+        ScreenCapture.SelectRegion(Services.Hotkeys, (_, crop, _) => _ = OcrAsync(crop));
 
-        var window = new ScreenshotOverlayWindow(source, bounds, Services.Hotkeys);
-        window.SelectionCompleted += rect => { window.Close(); _ = OcrAsync(source, rect); };
-        window.SelectionCancelled += () => window.Close();
-        window.Show();
-    }
-
-    private static BitmapSource ToSource(Bitmap bmp)
-    {
-        IntPtr hBitmap = bmp.GetHbitmap();
-        try { return Imaging.CreateBitmapSourceFromHBitmap(hBitmap, IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); }
-        finally { WinApi.DeleteObject(hBitmap); }
-    }
-
-    private async Task OcrAsync(BitmapSource screen, System.Drawing.Rectangle rect)
+    private async Task OcrAsync(BitmapSource crop)
     {
         try
         {
-            var crop = new CroppedBitmap(screen, new Int32Rect(rect.X, rect.Y, rect.Width, rect.Height));
             using var gdi = ToGdiBitmap(crop);
             var text = await OcrHelper.RecognizeAsync(gdi);
             if (string.IsNullOrWhiteSpace(text))

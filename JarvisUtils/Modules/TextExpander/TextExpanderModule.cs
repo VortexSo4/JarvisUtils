@@ -1,15 +1,9 @@
-﻿using System;
-using System.Collections.Concurrent;
+using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Media;
-using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using JarvisUtils.Core;
 
@@ -18,43 +12,33 @@ namespace JarvisUtils.Modules.TextExpander;
 // ─── Основной модуль ────────────────────────────────────────────────
 public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 {
-    private const bool TraceKeys = false;
-
-    // Реестр встроенных функций
-    private static readonly Dictionary<string, IExpansionFunction> Functions = new()
-    {
-        ["incr"] = new IncrFunction(),
-        ["rand"] = new RandFunction(),
-        ["date"] = new DateFunction(),
-        ["time"] = new TimeFunction(),
-        ["repeat"] = new RepeatFunction(),
-        ["calc"] = new CalcFunction(),
-    };
-
-    // Кеш скомпилированных регулярных выражений для каждого правила
-    private readonly ConcurrentDictionary<ExpansionRule, Regex> _regexCache = new();
+    private static readonly bool TraceKeys = false; // не const: иначе предупреждения о недостижимом коде
+    private const int BufferLimit = 100;
+    private const long UndoWindowMs = 30_000;
 
     public sealed class Settings
     {
         public List<ExpansionRule> Rules { get; set; } = new();
     }
 
+    /// <summary>Последняя «простая» подстановка — её можно отменить Backspace'ом.</summary>
+    private sealed record UndoState(IntPtr Hwnd, int InsertedUnits, string Trigger, long Tick);
+
     private Settings _settings = null!;
+    private readonly TriggerMatcher _matcher = new();
+    private CounterStore _counters = null!;
+    private ExpansionSender _sender = null!;
     private readonly StringBuilder _buffer = new();
     private readonly KeyboardStateTracker _keyboard = new();
     private DispatcherTimer? _idle;
     private IntPtr _lastFocus = IntPtr.Zero;
-
-    // ── UI редактора ──
-    private static readonly Color CardIdle = Color.FromRgb(0x19, 0x1C, 0x25);
-    private static readonly Color CardHover = Color.FromRgb(0x1F, 0x23, 0x30);
-    private readonly List<ExpansionRule> _rows = new();
-    private StackPanel? _rowsPanel;
-    private TextBlock? _savedLabel;
-    private DispatcherTimer? _saveDebounce;
-    private bool _dirty;
+    private uint _lastFocusPid;
+    private bool _busy;      // идёт подстановка с интерактивом/асинхронными функциями
+    private long _keySerial; // счётчик «настоящих» нажатий — понять, не печатал ли пользователь во время подстановки
+    private UndoState? _undo;
 
     public override string DisplayName => "Текстовые сокращения";
+    public override string Icon => FluentIcons.Lightning;
 
     protected override void RegisterHotkeys() { } // нет хоткеев
 
@@ -65,17 +49,39 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
 
         // Теперь загружаем настройки
         _settings = Services.Settings.Load<Settings>(Name);
-        if (_settings.Rules == null) _settings.Rules = new List<ExpansionRule>();
+        _settings.Rules ??= new List<ExpansionRule>();
+        _counters = new CounterStore(Services.Settings);
+        _sender = new ExpansionSender(Services.Input);
 
         Log.Info($"TextExpander: загружено правил — {_settings.Rules.Count}");
 
         _idle = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-        _idle.Tick += (_, _) => _buffer.Clear();
+        _idle.Tick += (_, _) => { _idle.Stop(); _buffer.Clear(); };
+
+        Prewarm();
+    }
+
+    /// <summary>
+    /// Компиляция триггеров и прогрев Roslyn — в фоне, а не на первом нажатии в хуке.
+    /// </summary>
+    private void Prewarm()
+    {
+        Application.Current?.Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            foreach (var rule in _settings.Rules)
+            {
+                var compiled = _matcher.Get(rule);
+                if (!compiled.IsValid) Log.Warn($"TextExpander: правило '{rule.TriggerPattern}' отключено — {compiled.Error}");
+            }
+            if (_settings.Rules.Any(r => r.Enabled && (r.ReplacementTemplate ?? "").Contains("{=")))
+                ScriptRunner.Warmup();
+        });
     }
 
     protected override void OnEnabled()
     {
         _lastFocus = WinApi.GetForegroundWindow();
+        _lastFocusPid = ForegroundHelper.ProcessIdOf(_lastFocus);
         Services.Keyboard.KeyDown += OnKeyDown;
         Services.Keyboard.KeyUp += OnKeyUp;
         Services.Keyboard.MouseDown += OnGlobalMouseDown;
@@ -88,16 +94,51 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         Services.Keyboard.KeyUp -= OnKeyUp;
         Services.Keyboard.MouseDown -= OnGlobalMouseDown;
         _buffer.Clear();
+        _undo = null;
         Log.Info("TextExpander: подписка на клавиатуру снята");
     }
 
+    private static bool IsModifier(uint vk) =>
+        vk is 0x10 or 0x11 or 0x12 or 0x5B or 0x5C or 0xA0 or 0xA1 or 0xA2 or 0xA3 or 0xA4 or 0xA5 or 0x14;
+
+    // ВНИМАНИЕ: коллбэк low-level хука на UI-потоке. Всё, что дольше пары миллисекунд,
+    // замораживает ввод во всей системе — тяжёлое уходит в Dispatcher.BeginInvoke.
     private void OnKeyDown(object? sender, KeyHookEventArgs e)
     {
-        if (e.IsInjected || Suspended) return;
+        if (e.IsInjected) return;
         _keyboard.OnKey(e.Vk, true);
+        if (Suspended) return;
+
+        bool modifier = IsModifier(e.Vk);
+        if (!modifier) _keySerial++;
 
         var focus = WinApi.GetForegroundWindow();
-        if (focus != _lastFocus) { _lastFocus = focus; _buffer.Clear(); }
+        if (focus != _lastFocus)
+        {
+            _lastFocus = focus;
+            _lastFocusPid = ForegroundHelper.ProcessIdOf(focus);
+            _buffer.Clear();
+            _undo = null;
+        }
+
+        if (_busy) { _buffer.Clear(); return; }
+
+        // Отмена: Backspace сразу после подстановки (до любой другой клавиши).
+        // Удерживаемый Shift от «:» шлёт автоповтор keydown — модификаторы отмену не сбрасывают.
+        if (_undo != null && !modifier)
+        {
+            var undo = _undo;
+            _undo = null;
+            if (e.Vk == 0x08 && !_keyboard.HasNonShiftModifier && undo.Hwnd == focus &&
+                Environment.TickCount64 - undo.Tick < UndoWindowMs)
+            {
+                e.Handled = true; // сам Backspace не доходит до приложения
+                _buffer.Clear();
+                Log.Info($"TextExpander: отмена подстановки '{undo.Trigger}'");
+                Application.Current.Dispatcher.BeginInvoke(DispatcherPriority.Input, () => RunUndo(undo));
+                return;
+            }
+        }
 
         _idle!.Stop();
         _idle.Start();
@@ -128,8 +169,11 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         }
 
         _buffer.Append(ch.Value);
-        if (_buffer.Length > 100) _buffer.Remove(0, _buffer.Length - 100);
+        if (_buffer.Length > BufferLimit) _buffer.Remove(0, _buffer.Length - BufferLimit);
         if (TraceKeys) Log.Info($"TE: '{ch}' → буфер='{_buffer}'");
+
+        // Свои окна (поле {input}, настройки) не расширяем — там набирают сами шаблоны
+        if (_lastFocusPid == (uint)Environment.ProcessId) return;
         TryExpand();
     }
 
@@ -139,288 +183,162 @@ public sealed class TextExpanderModule : JarvisModuleBase, IModuleSettingsEditor
         _keyboard.OnKey(e.Vk, false);
     }
 
-    private void OnGlobalMouseDown(object? sender, MouseHookEventArgs e) => _buffer.Clear();
+    private void OnGlobalMouseDown(object? sender, MouseHookEventArgs e)
+    {
+        _buffer.Clear();
+        _undo = null;
+    }
 
-    // ── Основная логика поиска и подстановки ──
+    // ── Поиск и подстановка ──
 
     private void TryExpand()
     {
-        var raw = _buffer.ToString();
-        foreach (var rule in _settings.Rules.OrderByDescending(r => r.TriggerPattern.Length))
+        var match = _matcher.Match(_settings.Rules, _buffer.ToString(), () => ForegroundHelper.ProcessName(_lastFocusPid));
+        if (match == null) return;
+
+        _buffer.Clear();
+        Log.Info($"TextExpander: сработало '{match.Value}' (шаблон '{match.Rule.TriggerPattern}')");
+        var hwnd = _lastFocus;
+        long serial = _keySerial;
+        Application.Current.Dispatcher.BeginInvoke(DispatcherPriority.Input, () => _ = RunExpansionAsync(match, hwnd, serial));
+    }
+
+    /// <summary>
+    /// Конвейер: стереть триггер → вычислить шаблон (может показать выбор/ввод) →
+    /// вернуть фокус исходному окну → вставить. Отмена интерактива возвращает набранный триггер.
+    /// Для шаблонов без асинхронных функций всё выполняется синхронно, одной операцией диспетчера.
+    /// </summary>
+    private async Task RunExpansionAsync(TriggerMatch match, IntPtr hwnd, long serial)
+    {
+        _busy = true;
+        var title = string.IsNullOrWhiteSpace(match.Rule.Name) ? match.Rule.TriggerPattern : match.Rule.Name!;
+        var session = new InteractiveSession(Services, title);
+        try
         {
-            if (string.IsNullOrEmpty(rule.TriggerPattern)) continue;
+            Services.Input.SendBackspaces(match.Length);
 
-            var regex = GetRegex(rule);
-            var match = regex.Match(raw);
-            if (!match.Success) continue;
-
-            // Извлекаем параметры
-            var args = new List<string>();
-            int groupIndex = 1;
-            while (true)
+            var ctx = new ExpansionContext
             {
-                var groupName = $"p{groupIndex}";
-                var group = match.Groups[groupName];
-                if (!group.Success) break;
-                args.Add(group.Value);
-                groupIndex++;
+                Args = match.Args,
+                Named = match.Named,
+                Services = Services,
+                Ui = session,
+                Counters = _counters,
+                Title = title
+            };
+            var output = await TemplateEngine.EvaluateAsync(match.Rule.ReplacementTemplate ?? "", ctx);
+
+            if (session.FocusLost) return; // кликнули мимо окна ввода — пользователь ушёл, ничего не печатаем
+
+            if (ctx.UsedInteractiveUi && !await ForegroundHelper.RestoreAsync(hwnd))
+            {
+                if (!output.Cancelled) await CopyAsFallbackAsync(output.Text);
+                return;
             }
 
-            // Подставляем параметры в шаблон замены
-            var replacement = rule.ReplacementTemplate;
-            for (int i = 0; i < args.Count; i++)
-                replacement = replacement.Replace($"%{i + 1}", args[i]);
-
-            // Обрабатываем встроенные функции
-            var final = ExpandTokens(replacement);
-
-            int len = match.Length;
-            _buffer.Clear();
-            Log.Info($"TextExpander: сработало '{match.Value}' (шаблон '{rule.TriggerPattern}')");
-            Application.Current.Dispatcher.BeginInvoke(DispatcherPriority.Input, () =>
+            if (output.Cancelled)
             {
-                Services.Input.SendBackspaces(len);
-                Services.Input.SendText(final);
-            });
-            break;
+                Services.Input.SendText(match.Value); // Esc — вернуть набранное
+                return;
+            }
+
+            output.ApplyCase(match.Case);
+            if (output.Errors.Count > 0)
+            {
+                Log.Warn($"TextExpander: '{match.Rule.TriggerPattern}': {string.Join("; ", output.Errors)}");
+                Services.Overlay.ShowToast(output.Errors[0], DisplayName, 3000);
+            }
+
+            await _sender.SendAsync(output);
+
+            // Пока шла подстановка, пользователь мог продолжить печатать — тогда отмена неуместна
+            if (output.IsPlain && output.Text.Length > 0 && !ctx.UsedInteractiveUi && serial == _keySerial)
+                _undo = new UndoState(hwnd, ExpansionOutput.CaretUnits(output.Text), match.Value, Environment.TickCount64);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"TextExpander: подстановка '{match.Rule.TriggerPattern}': {ex}");
+        }
+        finally
+        {
+            _busy = false;
+            _buffer.Clear();
         }
     }
 
-    private static Regex BuildRegexFromPattern(string pattern)
+    private async void RunUndo(UndoState undo)
     {
-        var escaped = Regex.Escape(pattern);
-        var regexPattern = Regex.Replace(escaped, @"%(\d)", m =>
-        {
-            int num = int.Parse(m.Groups[1].Value);
-            return $"(?<p{num}>.+?)";
-        });
-        return new Regex(regexPattern + "$", RegexOptions.Compiled);
+        try { await _sender.UndoAsync(undo.InsertedUnits, undo.Trigger); }
+        catch (Exception ex) { Log.Error($"TextExpander: отмена: {ex}"); }
     }
 
-    private Regex GetRegex(ExpansionRule rule)
+    private async Task CopyAsFallbackAsync(string text)
     {
-        return _regexCache.GetOrAdd(rule, r => BuildRegexFromPattern(r.TriggerPattern));
+        if (text.Length == 0) return;
+        var clipboard = Services.Clipboard;
+        await Task.Run(() => clipboard.SetText(text));
+        Services.Overlay.ShowToast("Не удалось вернуть фокус окну — результат скопирован в буфер обмена", DisplayName, 3000);
     }
 
-    private static string ExpandTokens(string input)
+    /// <summary>Интерактив одной подстановки: список выбора (оверлей) и окно ввода.</summary>
+    private sealed class InteractiveSession(IJarvisServices services, string title) : IExpansionUi
     {
-        var pattern = @"\{(\w+)(?:\(([^)]*)\))?\}";
-        return Regex.Replace(input, pattern, match =>
-        {
-            string funcName = match.Groups[1].Value;
-            string argsRaw = match.Groups[2].Success ? match.Groups[2].Value : "";
-            var args = argsRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        public bool FocusLost { get; private set; }
 
-            if (Functions.TryGetValue(funcName, out var func))
+        public Task<string?> ChooseAsync(string popupTitle, IReadOnlyList<string> options)
+        {
+            var tcs = new TaskCompletionSource<string?>();
+            services.Overlay.ShowListPopup(new ListPopupRequest
             {
-                var result = func.Evaluate(args);
-                return result ?? match.Value;
-            }
-            return match.Value;
-        });
+                Title = popupTitle,
+                Items = options.Select(o => new OverlayListItem(TextUtil.Preview(o, 80))).ToList(),
+                OnPick = i => tcs.TrySetResult(options[i]),
+                OnCancel = () => tcs.TrySetResult(null)
+            });
+
+            // Попап может закрыть другой попап (ForceClose без OnCancel) — тогда подстановка
+            // висела бы вечно. Ловим закрытие окна; результат ставим отложенно, потому что при
+            // выборе Close() вызывается ДО OnPick и иначе выбор считался бы отменой.
+            var popup = Application.Current.Windows.OfType<ListPopupWindow>().LastOrDefault();
+            if (popup != null)
+                popup.Closed += (_, _) => Application.Current.Dispatcher.BeginInvoke(() => tcs.TrySetResult(null));
+            return tcs.Task;
+        }
+
+        public async Task<string?> PromptAsync(string label, string? initial)
+        {
+            var window = new InputPromptWindow(title, label, initial);
+            window.Show();
+            var result = await window.Result;
+            if (window.FocusLost) FocusLost = true;
+            return result;
+        }
     }
 
     // ══════════════ РЕДАКТОР НАСТРОЕК ══════════════
 
-    public FrameworkElement BuildEditor()
+    public FrameworkElement BuildEditor() => new TextExpanderEditor(
+        _settings.Rules,
+        _matcher,
+        rules => { _settings.Rules = rules; SaveSettings(_settings); },
+        DryRunAsync).Build();
+
+    /// <summary>Проверка в редакторе: поиск правила и вычисление без отправки.</summary>
+    private async Task<(TriggerMatch? Match, ExpansionOutput? Output)> DryRunAsync(IReadOnlyList<ExpansionRule> rules, string text)
     {
-        _rows.Clear();
-        _rows.AddRange(_settings.Rules);
-
-        var root = new StackPanel { Margin = new Thickness(0, 6, 0, 0) };
-
-        root.Children.Add(new TextBlock
+        var match = _matcher.Match(rules, text, processName: null, ignoreAppFilter: true);
+        if (match == null) return (null, null);
+        var ctx = new ExpansionContext
         {
-            Text = "Правило: шаблон триггера с маркерами %1, %2, … (например :rand%1-%2:) и шаблон замены, в котором можно использовать те же маркеры и функции: {rand(1,100)}, {date}, {time}, {repeat(3,hello)}, {incr(1,10,n)}, {calc(12+34)}.",
-            Foreground = JarvisTheme.ForegroundBrush(0.55),
-            FontSize = 12.5,
-            TextWrapping = TextWrapping.Wrap
-        });
-
-        var head = new Grid { Margin = new Thickness(12, 18, 12, 6) };
-        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var h1 = HeadLabel("ШАБЛОН ТРИГГЕРА");
-        var h2 = HeadLabel("ШАБЛОН ЗАМЕНЫ");
-        Grid.SetColumn(h1, 0);
-        Grid.SetColumn(h2, 1);
-        head.Children.Add(h1);
-        head.Children.Add(h2);
-        root.Children.Add(head);
-
-        _rowsPanel = new StackPanel();
-        root.Children.Add(_rowsPanel);
-        foreach (var row in _rows) _rowsPanel.Children.Add(BuildRow(row));
-        if (_rows.Count == 0) _rowsPanel.Children.Add(EmptyHint());
-
-        _savedLabel = new TextBlock
-        {
-            Text = "✓  сохранено",
-            Foreground = JarvisTheme.AccentBrush,
-            FontSize = 11,
-            Opacity = 0,
-            Margin = new Thickness(12, 8, 0, 0)
+            Args = match.Args,
+            Named = match.Named,
+            Services = Services,
+            Counters = _counters,
+            DryRun = true,
+            Title = match.Rule.Name ?? match.Rule.TriggerPattern
         };
-        root.Children.Add(_savedLabel);
-
-        var add = new Button
-        {
-            Content = "+  Добавить правило",
-            HorizontalAlignment = HorizontalAlignment.Left,
-            Margin = new Thickness(0, 10, 0, 0)
-        };
-        add.Click += (_, _) => AddRow();
-        root.Children.Add(add);
-
-        root.Children.Add(new TextBlock
-        {
-            Text = "Изменения сохраняются автоматически.",
-            Foreground = JarvisTheme.ForegroundBrush(0.4),
-            FontSize = 11,
-            Margin = new Thickness(0, 12, 0, 0)
-        });
-
-        _saveDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
-        _saveDebounce.Tick += (_, _) => { _saveDebounce!.Stop(); FlushSave(); };
-
-        root.Unloaded += (_, _) => FlushSave();
-        return root;
-    }
-
-    private static TextBlock HeadLabel(string text) => new()
-    {
-        Text = text,
-        Foreground = JarvisTheme.ForegroundBrush(0.4),
-        FontSize = 10.5,
-        FontWeight = FontWeights.SemiBold
-    };
-
-    private static TextBlock EmptyHint() => new()
-    {
-        Text = "Пока нет правил — добавьте первое.",
-        Foreground = JarvisTheme.ForegroundBrush(0.4),
-        FontSize = 12.5,
-        Margin = new Thickness(12, 8, 0, 8)
-    };
-
-    private Border BuildRow(ExpansionRule model)
-    {
-        var trigger = new TextBox
-        {
-            FontFamily = new FontFamily("Consolas"),
-            VerticalAlignment = VerticalAlignment.Top,
-            TextWrapping = TextWrapping.NoWrap
-        };
-        trigger.SetBinding(TextBox.TextProperty, new Binding(nameof(ExpansionRule.TriggerPattern))
-        { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
-        trigger.TextChanged += (_, _) => ScheduleSave();
-
-        var repl = new TextBox
-        {
-            AcceptsReturn = true,
-            TextWrapping = TextWrapping.Wrap,
-            MinHeight = 38,
-            MaxHeight = 110,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto
-        };
-        repl.SetBinding(TextBox.TextProperty, new Binding(nameof(ExpansionRule.ReplacementTemplate))
-        { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
-        repl.TextChanged += (_, _) => ScheduleSave();
-
-        var del = new Button { Content = "×" };
-        del.SetResourceReference(Button.StyleProperty, "IconButton");
-        del.Margin = new Thickness(10, 4, 0, 0);
-        del.VerticalAlignment = VerticalAlignment.Top;
-
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        Grid.SetColumn(trigger, 0);
-        Grid.SetColumn(repl, 2);
-        Grid.SetColumn(del, 3);
-
-        var arrow = new TextBlock
-        {
-            Text = "→",
-            Foreground = JarvisTheme.ForegroundBrush(0.35),
-            VerticalAlignment = VerticalAlignment.Center,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(6, 0, 6, 0)
-        };
-        Grid.SetColumn(arrow, 1);
-
-        grid.Children.Add(trigger);
-        grid.Children.Add(arrow);
-        grid.Children.Add(repl);
-        grid.Children.Add(del);
-
-        var card = new Border
-        {
-            Background = new SolidColorBrush(CardIdle),
-            CornerRadius = new CornerRadius(10),
-            Padding = new Thickness(10),
-            Margin = new Thickness(0, 0, 0, 6),
-            Child = grid,
-            Tag = trigger
-        };
-        card.MouseEnter += (_, _) => Paint(card, CardHover);
-        card.MouseLeave += (_, _) => Paint(card, CardIdle);
-        del.Click += (_, _) => RemoveRow(model, card);
-        return card;
-    }
-
-    private static void Paint(Border card, Color color) =>
-        ((SolidColorBrush)card.Background).BeginAnimation(SolidColorBrush.ColorProperty,
-            new ColorAnimation(color, TimeSpan.FromMilliseconds(90)));
-
-    private void AddRow()
-    {
-        if (_rowsPanel!.Children.Count == 1 && _rowsPanel.Children[0] is TextBlock)
-            _rowsPanel.Children.Clear();
-
-        var model = new ExpansionRule();
-        _rows.Add(model);
-        var card = BuildRow(model);
-        _rowsPanel.Children.Add(card);
-        card.Loaded += (_, _) => ((TextBox)card.Tag!).Focus();
-        ScheduleSave();
-    }
-
-    private void RemoveRow(ExpansionRule model, Border card)
-    {
-        _rows.Remove(model);
-        _rowsPanel!.Children.Remove(card);
-        if (_rows.Count == 0) _rowsPanel.Children.Add(EmptyHint());
-        ScheduleSave();
-    }
-
-    private void ScheduleSave()
-    {
-        _dirty = true;
-        _saveDebounce?.Stop();
-        _saveDebounce?.Start();
-    }
-
-    private void FlushSave()
-    {
-        if (!_dirty || _rowsPanel == null) return;
-        _dirty = false;
-        _saveDebounce?.Stop();
-        _settings.Rules = _rows
-            .Where(r => !string.IsNullOrWhiteSpace(r.TriggerPattern))
-            .ToList();
-        SaveSettings(_settings);
-        FlashSaved();
-    }
-
-    private void FlashSaved()
-    {
-        if (_savedLabel == null) return;
-        _savedLabel.BeginAnimation(UIElement.OpacityProperty, null);
-        _savedLabel.Opacity = 1;
-        var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(700)) { BeginTime = TimeSpan.FromMilliseconds(1200) };
-        _savedLabel.BeginAnimation(UIElement.OpacityProperty, fade);
+        var output = await TemplateEngine.EvaluateAsync(match.Rule.ReplacementTemplate ?? "", ctx);
+        output.ApplyCase(match.Case);
+        return (match, output);
     }
 }

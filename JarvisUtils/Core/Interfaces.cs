@@ -43,6 +43,7 @@ public interface IJarvisModule
 {
     string Name { get; }
     string DisplayName { get; }
+    string Icon { get; }
     bool IsEnabled { get; }
     bool Suspended { get; set; }
     void Initialize(IJarvisServices services);
@@ -67,14 +68,14 @@ public interface IClipboardService
     void SetText(string text);
     System.Windows.Media.Imaging.BitmapSource? GetImage();
     void SetImage(System.Windows.Media.Imaging.BitmapSource image);
-    IDataObject? Backup();
-    void Restore(IDataObject? backup);
 }
 
 public interface IInputSimulator
 {
-    void SendText(string text);
+    void SendText(string text);  // короткое печатается, длинное — через буфер
+    void PasteText(string text); // всегда через буфер (Ctrl+V) с восстановлением
     void SendBackspaces(int count);
+    void SendKey(ushort vk, int count = 1); // одиночная клавиша (стрелки, Enter, Tab…) count раз
     void SendCtrlC();
     void SendCtrlV();
     void ReplaceSelection(string text);
@@ -160,4 +161,13 @@ public sealed class HotkeySlot(string label, Func<string> get, Action<string> se
 }
 
 public interface IHotkeyConfigurable { IReadOnlyList<HotkeySlot> HotkeySlots { get; } }
+
+/// <summary>Действие модуля для радиального быстрого меню (открыть калькулятор, пипетку…).</summary>
+public sealed record QuickAction(string Title, string Glyph, Action Run);
+
+/// <summary>
+/// Модуль предлагает действия в радиальное меню. Меню не забирает фокус — действия
+/// выполняются так же, как по хоткею: активное окно пользователя остаётся активным.
+/// </summary>
+public interface IQuickActions { IReadOnlyList<QuickAction> QuickActions { get; } }
 public interface IModuleSettingsEditor { FrameworkElement BuildEditor(); }

@@ -7,7 +7,7 @@ using JarvisUtils.Core;
 
 namespace JarvisUtils.Modules.CaseConverter;
 
-public sealed class CaseConverterModule : JarvisModuleBase, IHotkeyConfigurable
+public sealed class CaseConverterModule : JarvisModuleBase, IHotkeyConfigurable, IQuickActions
 {
     public sealed class Settings
     {
@@ -24,6 +24,12 @@ public sealed class CaseConverterModule : JarvisModuleBase, IHotkeyConfigurable
     private int _lastIndex;
 
     public override string DisplayName => "Конвертер регистра";
+    public override string Icon => FluentIcons.Font;
+
+    public IReadOnlyList<QuickAction> QuickActions =>
+    [
+        new("Регистр", FluentIcons.Font, OpenVariantPopup)
+    ];
 
     protected override void RegisterHotkeys() { } // работает через LL-hook: нужно различать press/hold
 

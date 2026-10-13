@@ -4,13 +4,16 @@ using System.Windows;
 using JarvisUtils.Core;
 using JarvisUtils.Modules.Calculator;
 using JarvisUtils.Modules.CaseConverter;
-using JarvisUtils.Modules.ClipboardFavorites;
+using JarvisUtils.Modules.ClipboardHistory;
 using JarvisUtils.Modules.CodeMerger;
+using JarvisUtils.Modules.ColorPicker;
 using JarvisUtils.Modules.LayoutFixer;
 using JarvisUtils.Modules.PlainTextPaste;
+using JarvisUtils.Modules.QuickMenu;
 using JarvisUtils.Modules.ScreenshotOcr;
 using JarvisUtils.Modules.TextExpander;
 using JarvisUtils.Modules.Widgets;
+using JarvisUtils.Modules.WindowPin;
 using JarvisUtils.UI.Tray;
 
 namespace JarvisUtils.App;
@@ -64,11 +67,15 @@ public partial class App : Application
             new LayoutFixerModule(),
             new CaseConverterModule(),
             new TextExpanderModule(),
-            new ClipboardFavoritesModule(),
             new ScreenshotOcrModule(),
             new CodeMergerModule(),
             new CalculatorModule(),
-            new WidgetsModule()
+            new WidgetsModule(),
+            new ClipboardHistoryModule(),
+            new ColorPickerModule(),
+            new WindowPinModule(),
+            // последним: собирает действия остальных модулей
+            new QuickMenuModule(() => _runner!.Modules, () => _tray?.OpenSettings())
         ]);
 
         _tray = new TrayHost(services.TrayMenu, _runner);

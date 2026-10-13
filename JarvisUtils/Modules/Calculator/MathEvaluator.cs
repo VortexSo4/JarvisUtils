@@ -9,8 +9,10 @@ namespace JarvisUtils.Modules.Calculator;
 /// Вычислитель выражений в духе калькулятора PowerToys Run.
 /// Поддерживает: + - * / % ^ (или **), факториал «!» (целые точно, дробные — через
 /// гамма-функцию), константы (pi, e, tau, phi), функции (sqrt, ln, log, sin…, min, max…),
-/// скобки, неявное умножение (2pi, 2(3+4)) и юникод-символы (π, √, ×, ÷, −, ², ³).
+/// скобки, неявное умножение (2pi, 2(3+4)) и юникод-символы (π, √, ×, ÷, −, ², ³),
+/// литералы 0xFF / 0b1010 / 0o17, «20% of 150» и «150 + 20%» (= 180).
 /// Тригонометрия — в радианах, десятичный разделитель — точка.
+/// Перевод единиц, валют и систем счисления — уровнем выше, в <see cref="CalcEngine"/>.
 /// </summary>
 public static class MathEvaluator
 {
@@ -28,6 +30,19 @@ public static class MathEvaluator
         catch (EvalException ex) { error = ex.Message; }
         catch { error = "не удалось вычислить"; }
         return false;
+    }
+
+    /// <summary>
+    /// Как <see cref="TryEvaluate"/>, но понимает и «10 km in mi», «100$ в руб», «255 in hex» —
+    /// результат уже отформатирован (число без единицы: её пользователь написал сам).
+    /// Курс валют ещё не загружен → false и error «загрузка курса…» (загрузка уже запущена).
+    /// </summary>
+    public static bool TryEvaluateText(string expression, out string result, out string error)
+    {
+        var r = CalcEngine.Evaluate(expression);
+        result = r.Kind == CalcResultKind.Value ? r.Text : "";
+        error = r.Kind == CalcResultKind.Value ? "" : r.Text;
+        return r.Kind == CalcResultKind.Value;
     }
 
     /// <summary>Компактная запись: без хвостов нулей и артефактов двоичной арифметики (0.1+0.2 → 0.3).</summary>
@@ -81,7 +96,26 @@ public static class MathEvaluator
                 case 'π': toks.Add(Id("pi")); i++; break;
                 case '²' or '³': toks.Add(Op(c)); i++; break; // постфиксные степени
                 default:
-                    if (char.IsDigit(c) || c == '.')
+                    if (c == '0' && i + 2 < s.Length && RadixOf(s[i + 1]) is int radix and > 0 && IsRadixDigit(s[i + 2], radix))
+                    {
+                        // 0xFF, 0b1010, 0o17 (подчёркивания-разделители: 0b1111_0000)
+                        int start = i;
+                        i += 2;
+                        ulong acc = 0;
+                        while (i < s.Length && (IsRadixDigit(s[i], radix) || s[i] == '_'))
+                        {
+                            if (s[i] != '_')
+                            {
+                                ulong digit = (ulong)Convert.ToInt32(s[i].ToString(), 16);
+                                if (acc > (ulong.MaxValue - digit) / (ulong)radix)
+                                    throw new EvalException($"«{s[start..]}» — слишком большое число");
+                                acc = acc * (ulong)radix + digit;
+                            }
+                            i++;
+                        }
+                        toks.Add(Num(acc));
+                    }
+                    else if (char.IsDigit(c) || c == '.')
                     {
                         int start = i;
                         while (i < s.Length && char.IsDigit(s[i])) i++;
@@ -118,10 +152,25 @@ public static class MathEvaluator
         return toks;
     }
 
+    private static int RadixOf(char c) => c switch
+    {
+        'x' or 'X' => 16,
+        'b' or 'B' => 2,
+        'o' or 'O' => 8,
+        _ => 0
+    };
+
+    private static bool IsRadixDigit(char c, int radix) => radix switch
+    {
+        2 => c is '0' or '1',
+        8 => c is >= '0' and <= '7',
+        _ => char.IsAsciiHexDigit(c)
+    };
+
     // ── Грамматика (рекурсивный спуск) ──
     //
-    // Add     := Mul (('+' | '-') Mul)*
-    // Mul     := Unary (('*' | '/' | '%' | неявное умножение) Unary)*
+    // Add     := Mul (('+' | '-') Mul)*               «a ± b%» — это a·(1 ± b/100), как у Google
+    // Mul     := Unary (('*' | '/' | '%' | неявное умножение) Unary | '%' | '%' of Unary)*
     // Unary   := ('+' | '-') Unary | Pow
     // Pow     := Postfix ('^' Unary)?              правая ассоциативность; -2^2 = -(2^2)
     // Postfix := Primary ('!' | '²' | '³')*
@@ -146,30 +195,44 @@ public static class MathEvaluator
 
         private double Add()
         {
-            double v = Mul();
+            double v = Mul(out _);
             while (Peek is { Kind: TokKind.Op, Op: '+' or '-' })
             {
                 char op = Next().Op;
-                double r = Mul();
+                double r = Mul(out bool percentTerm);
+                if (percentTerm) r *= v; // «150 + 20%» = 180: процент берётся от левой части
                 v = op == '+' ? v + r : v - r;
             }
             return v;
         }
 
-        private double Mul()
+        /// <param name="percentTerm">слагаемое — ровно «число%» (без других операций): для «a ± b%»</param>
+        private double Mul(out bool percentTerm)
         {
             double v = Unary();
+            percentTerm = false;
+            int ops = 0;
             while (true)
             {
-                if (Peek is { Kind: TokKind.Op, Op: '%' } && !StartsValue(Peek2))
+                if (Peek is { Kind: TokKind.Op, Op: '%' } && Peek2 is { Kind: TokKind.Ident, Text: "of" or "от" })
+                {
+                    Next(); Next();
+                    v = v / 100 * Unary(); // «20% of 150» = 30; раньше это была ошибка, так что ничего не ломаем
+                    ops++;
+                    percentTerm = false;
+                }
+                else if (Peek is { Kind: TokKind.Op, Op: '%' } && !StartsValue(Peek2))
                 {
                     Next();
                     v /= 100; // «50%» → 0.5: % без операнда справа — проценты
+                    percentTerm = ++ops == 1;
                 }
                 else if (Peek is { Kind: TokKind.Op, Op: '*' or '/' or '%' })
                 {
                     char op = Next().Op;
                     double r = Unary();
+                    ops++;
+                    percentTerm = false;
                     if (op == '*') v *= r;
                     else
                     {
@@ -180,6 +243,8 @@ public static class MathEvaluator
                 else if (StartsValue(Peek))
                 {
                     v *= Unary(); // неявное умножение: 2pi, 2(3+4), (1+2)(3+4), 2 sqrt(2)
+                    ops++;
+                    percentTerm = false;
                 }
                 else return v;
             }

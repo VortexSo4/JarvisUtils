@@ -9,7 +9,7 @@ namespace JarvisUtils.UI.Tray;
 public sealed class TrayHost : IDisposable
 {
     private readonly NotifyIcon _notifyIcon;
-    private readonly ITrayMenuBuilder _trayMenu; // больше не используется для меню, но оставлен на случай расширения
+    private readonly ITrayMenuBuilder _trayMenu; // действия модулей (тумблеры модулей — в настройках, не в трее)
     private readonly ModuleRunner _runner;
     private readonly ContextMenuStrip _menu;
     private readonly IntPtr _iconHandle;
@@ -46,13 +46,27 @@ public sealed class TrayHost : IDisposable
     private void BuildSimpleMenu()
     {
         _menu.Items.Clear();
-        var exit = new ToolStripMenuItem("Выход") { ForeColor = Color.FromArgb(230, 235, 245) };
+        var fore = Color.FromArgb(230, 235, 245);
+
+        // Действия модулей (новая заметка, закрепить скриншот…). Тумблеры модулей
+        // сюда не попадают — меню трея короткое, включение модулей живёт в настройках.
+        foreach (var entry in _trayMenu.Entries)
+        {
+            if (entry is not TrayButtonItem button) continue;
+            var item = new ToolStripMenuItem(button.Header) { ForeColor = fore };
+            item.Click += (_, _) => button.OnClick();
+            _menu.Items.Add(item);
+        }
+        if (_menu.Items.Count > 0) _menu.Items.Add(new ToolStripSeparator());
+
+        var settings = new ToolStripMenuItem("Настройки") { ForeColor = fore };
+        settings.Click += (_, _) => OpenSettings();
+        _menu.Items.Add(settings);
+
+        var exit = new ToolStripMenuItem("Выход") { ForeColor = fore };
         exit.Click += (_, _) => System.Windows.Application.Current.Shutdown();
         _menu.Items.Add(exit);
     }
-
-    // Старый метод RebuildMenu больше не используется, но оставлен для совместимости (можно удалить).
-    // private void RebuildMenu() { ... }
 
     private static (IntPtr, Icon) CreateIcon()
     {

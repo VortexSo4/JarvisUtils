@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Threading;
 
 namespace JarvisUtils.Core;
@@ -89,6 +90,24 @@ public static class StaClipboard
         {
             Log.Warn($"clipboard: {ex.Message}");
             return default!;
+        }
+    }
+
+    /// <summary>Асинхронный вариант: вызывающий поток не блокируется вовсе (продолжает качать сообщения).</summary>
+    public static async Task<T?> RunAsync<T>(Func<T> func, int timeoutMs = DefaultTimeoutMs)
+    {
+        if (_dispatcher.HasShutdownStarted)
+            return default;
+
+        try
+        {
+            return await _dispatcher.InvokeAsync(func, DispatcherPriority.Send).Task
+                .WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"clipboard: {ex.Message}");
+            return default;
         }
     }
 

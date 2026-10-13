@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using JarvisUtils.Core;
 using JarvisUtils.UI.Theme;
 
@@ -18,9 +19,9 @@ public partial class SettingsWindow : Window
 
         // Сайдбар: «Общие» (index 0) + модули (index 1..N). Индексы ListBox смещены
         // на единицу относительно runner.Modules — учтено в SelectionChanged.
-        ModulesList.Items.Add("Общие");
+        ModulesList.Items.Add(SidebarItem(FluentIcons.Settings, "Общие"));
         foreach (var module in runner.Modules)
-            ModulesList.Items.Add(module.DisplayName);
+            ModulesList.Items.Add(SidebarItem(module.Icon, module.DisplayName));
         
         ModulesList.SelectionChanged += ModulesList_SelectionChanged;
 
@@ -30,6 +31,30 @@ public partial class SettingsWindow : Window
         Closed += (_, _) => _runner.ResumeAll();
 
         ModulesList.SelectedIndex = 0; // по умолчанию — «Общие»
+        SourceInitialized += (_, _) =>
+        {
+            // тёмный системный заголовок — в тон окну
+            int dark = 1;
+            WinApi.DwmSetWindowAttribute(new System.Windows.Interop.WindowInteropHelper(this).Handle,
+                WinApi.DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+        };
+    }
+
+    private static StackPanel SidebarItem(string glyph, string title)
+    {
+        var item = new StackPanel { Orientation = Orientation.Horizontal };
+        var icon = FluentIcons.Glyph(glyph, 15);
+        icon.Width = 20;
+        icon.Margin = new Thickness(0, 0, 10, 0);
+        var text = new TextBlock { Text = title, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+        // Элемент лежит в ListBox напрямую: его логический родитель — ListBox (чёрный Foreground
+        // по умолчанию), а не ListBoxItem. Цвет берём у пункта явно — и выделение его меняет.
+        var itemForeground = new Binding(nameof(ListBoxItem.Foreground)) { RelativeSource = new RelativeSource(RelativeSourceMode.FindAncestor, typeof(ListBoxItem), 1) };
+        icon.SetBinding(TextBlock.ForegroundProperty, itemForeground);
+        text.SetBinding(TextBlock.ForegroundProperty, itemForeground);
+        item.Children.Add(icon);
+        item.Children.Add(text);
+        return item;
     }
 
     private void ModulesList_SelectionChanged(object sender, SelectionChangedEventArgs e)

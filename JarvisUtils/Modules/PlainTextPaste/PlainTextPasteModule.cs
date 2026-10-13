@@ -8,7 +8,7 @@ using JarvisUtils.Core;
 
 namespace JarvisUtils.Modules.PlainTextPaste;
 
-public sealed class PlainTextPasteModule : JarvisModuleBase, IHotkeyConfigurable, IModuleSettingsEditor
+public sealed class PlainTextPasteModule : JarvisModuleBase, IHotkeyConfigurable, IModuleSettingsEditor, IQuickActions
 {
     public sealed class Settings
     {
@@ -18,6 +18,12 @@ public sealed class PlainTextPasteModule : JarvisModuleBase, IHotkeyConfigurable
     private Settings _settings = null!;
 
     public override string DisplayName => "Вставка без форматирования";
+    public override string Icon => FluentIcons.Paste;
+
+    public IReadOnlyList<QuickAction> QuickActions =>
+    [
+        new("Вставить без форматирования", FluentIcons.Paste, PastePlain)
+    ];
 
     protected override void RegisterHotkeys()
     {
@@ -41,26 +47,9 @@ public sealed class PlainTextPasteModule : JarvisModuleBase, IHotkeyConfigurable
         var raw = Services.Clipboard.GetText() ?? "";
         var clean = PlainTextRules.Load().Apply(raw); // правила читаются с диска — правки подхватываются без перезапуска
 
-        var backup = Services.Clipboard.Backup();
-        Services.Clipboard.SetText(clean); // только text-формат
-        Services.Input.SendCtrlV();
+        // только text-формат; исходный буфер (RTF/HTML/картинка) восстановится после вставки
+        Services.Input.PasteText(clean);
         Services.Overlay.ShowToast("Вставлено без форматирования", "Paste as Plain Text");
-
-        // восстанавливаем исходный буфер (RTF/HTML/картинка) после вставки
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
-        timer.Tick += (_, _) =>
-        {
-            timer.Stop();
-            try
-            {
-                Services.Clipboard.Restore(backup);
-            }
-            catch (Exception ex)
-            {
-                Log.Error($"Восстановление буфера обмена не удалось: {ex}");
-            }
-        };
-        timer.Start();
     }
 
     public FrameworkElement BuildEditor()

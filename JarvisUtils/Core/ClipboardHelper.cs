@@ -15,9 +15,7 @@ public sealed class ClipboardService : IClipboardService
     // UI-поток не может зависнуть надолго в принципе.
 
     private const int QuickTimeoutMs = 2000;   // Contains*/GetText/SetText — обычно мгновенно
-    private const int BackupTimeoutMs = 3000;  // дольше — монструозный отложенный рендеринг:
-                                              // лучше отказаться от restore, чем заморозить ввод
-    private const int RestoreTimeoutMs = 5000; // restore/SetImage/GetImage
+    private const int RestoreTimeoutMs = 5000; // SetImage/GetImage
 
     public bool ContainsText => StaClipboard.Run(SysClipboard.ContainsText, QuickTimeoutMs);
     public bool ContainsImage => StaClipboard.Run(SysClipboard.ContainsImage, QuickTimeoutMs);
@@ -45,26 +43,6 @@ public sealed class ClipboardService : IClipboardService
         if (image.CanFreeze) image.Freeze();
         StaClipboard.Run(() => Retry(() => SysClipboard.SetImage(image)), RestoreTimeoutMs);
     }
-
-    /// <summary>
-    /// Снимок текущего буфера. Возвращённый объект потоконебезопасен:
-    /// не трогать его с других потоков, только передать обратно в Restore().
-    /// </summary>
-    public IDataObject? Backup() => StaClipboard.Run(() =>
-    {
-        try
-        {
-            var current = SysClipboard.GetDataObject();
-            return current != null ? new DataObject(current) : null;
-        }
-        catch { return null; }
-    }, BackupTimeoutMs);
-
-    public void Restore(IDataObject? backup) => StaClipboard.Run(() =>
-    {
-        if (backup != null) Retry(() => SysClipboard.SetDataObject(backup, true));
-        else SysClipboard.Clear();
-    }, RestoreTimeoutMs);
 
     private static void Retry(Action action)
     {

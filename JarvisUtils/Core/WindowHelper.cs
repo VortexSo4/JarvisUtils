@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System;
+using System.Windows;
 using System.Windows.Interop;
 
 namespace JarvisUtils.Core;
@@ -11,6 +12,34 @@ public static class WindowHelper
         var hwnd = new WindowInteropHelper(window).Handle;
         int ex = WinApi.GetWindowLong(hwnd, WinApi.GWL_EXSTYLE);
         WinApi.SetWindowLong(hwnd, WinApi.GWL_EXSTYLE, ex | WinApi.WS_EX_NOACTIVATE | WinApi.WS_EX_TOOLWINDOW);
+    }
+
+    /// <summary>
+    /// Вывести окно на передний план и отдать ему клавиатуру. Обычный Activate() из фонового
+    /// трей-процесса Windows часто запрещает (foreground lock): окно появляется, но фокус
+    /// остаётся в прежнем приложении. Пока наш поток привязан к вводу активного окна,
+    /// SetForegroundWindow разрешён.
+    /// </summary>
+    public static void ForceForeground(Window window)
+    {
+        var hwnd = new WindowInteropHelper(window).Handle;
+        var foreground = WinApi.GetForegroundWindow();
+        if (hwnd != IntPtr.Zero && foreground != hwnd)
+        {
+            uint ownThread = WinApi.GetCurrentThreadId();
+            uint fgThread = foreground != IntPtr.Zero ? WinApi.GetWindowThreadProcessId(foreground, IntPtr.Zero) : 0;
+            bool attached = fgThread != 0 && fgThread != ownThread && WinApi.AttachThreadInput(ownThread, fgThread, true);
+            try
+            {
+                WinApi.BringWindowToTop(hwnd);
+                WinApi.SetForegroundWindow(hwnd);
+            }
+            finally
+            {
+                if (attached) WinApi.AttachThreadInput(ownThread, fgThread, false);
+            }
+        }
+        window.Activate();
     }
 
     /// <summary>

@@ -2,6 +2,7 @@
 using System.IO;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace JarvisUtils.Core;
 
@@ -11,7 +12,8 @@ public sealed class SettingsStore : ISettingsStore
     {
         WriteIndented = true,
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, // кириллица читаема в пользовательских файлах
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() } // enum словами; числа из старых файлов тоже читаются
     };
 
     public T Load<T>(string name) where T : class, new()

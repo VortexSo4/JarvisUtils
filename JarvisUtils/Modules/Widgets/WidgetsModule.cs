@@ -1,354 +1,409 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using JarvisUtils.Core;
-using JarvisUtils.UI.Settings;
-using JarvisUtils.UI.Theme;
+using JarvisUtils.Modules.ScreenshotOcr;
 
 namespace JarvisUtils.Modules.Widgets;
 
-public sealed class WidgetsModule : JarvisModuleBase, IHotkeyConfigurable, IModuleSettingsEditor
+/// <summary>
+/// Виджеты на рабочем столе: заметки, закреплённые скриншоты и «свои» (XAML + C#).
+/// Модуль владеет списком виджетов и их окнами; всё сохранение — отложенное и в фоне.
+/// </summary>
+public sealed class WidgetsModule : JarvisModuleBase, IHotkeyConfigurable, IModuleSettingsEditor, IQuickActions
 {
-    private WidgetsSettings _settings = null!;
-    private readonly List<WidgetWindow> _windows = [];
-    private LiveDataProvider? _liveData;
-    private bool _editMode;
-    private WrapPanel? _chipsHost;
+    private const int SaveDelayMs = 500;
+    private static readonly object FileGate = new();
 
-    public event Action? WidgetListChanged;
+    private WidgetsSettings _settings = null!;
+    private readonly Dictionary<string, WidgetWindow> _windows = new();
+    private DispatcherTimer? _saveTimer;
+    private bool _editMode;
+    private int _cascade;
+
+    /// <summary>Список виджетов или их состояние изменились (страница настроек перерисовывается).</summary>
+    public event Action? Changed;
 
     public override string DisplayName => "Виджеты";
+    public override string Icon => FluentIcons.Widgets;
+
+    public IReadOnlyList<QuickAction> QuickActions =>
+    [
+        new("Заметка", FluentIcons.Note, () => CreateNote(null)),
+        new("Закрепить скриншот", FluentIcons.Screenshot, () => PinScreenshot()),
+        new("Показать / скрыть виджеты", FluentIcons.Widgets, ToggleAll)
+    ];
+
+    internal IReadOnlyList<WidgetModel> Widgets => _settings.Widgets;
+    internal bool AllHidden => _settings.AllHidden;
+    internal bool EditMode => _editMode;
+
+    public override void Initialize(IJarvisServices services)
+    {
+        base.Initialize(services);
+        Services.TrayMenu.AddItem("Новая заметка", () => CreateNote(null));
+        Services.TrayMenu.AddItem("Закрепить скриншот", () => PinScreenshot());
+        Services.TrayMenu.AddItem("Показать / скрыть виджеты", ToggleAll);
+    }
 
     protected override void RegisterHotkeys()
     {
         _settings ??= LoadSettings<WidgetsSettings>();
         RegisterHotkey(_settings.HotkeyEditMode, ToggleEditMode);
+        RegisterHotkey(_settings.HotkeyNewNote, () => CreateNote(null));
+        RegisterHotkey(_settings.HotkeyPinScreenshot, () => PinScreenshot());
+        RegisterHotkey(_settings.HotkeyToggleAll, ToggleAll);
+    }
+
+    public IReadOnlyList<HotkeySlot> HotkeySlots =>
+    [
+        new("Новая заметка", () => _settings.HotkeyNewNote, g => SetHotkey(s => s.HotkeyNewNote = g)),
+        new("Закрепить скриншот области", () => _settings.HotkeyPinScreenshot, g => SetHotkey(s => s.HotkeyPinScreenshot = g)),
+        new("Показать / скрыть все виджеты", () => _settings.HotkeyToggleAll, g => SetHotkey(s => s.HotkeyToggleAll = g)),
+        new("Режим редактирования (рамки, сквозные клики выключены)", () => _settings.HotkeyEditMode, g => SetHotkey(s => s.HotkeyEditMode = g)),
+    ];
+
+    private void SetHotkey(Action<WidgetsSettings> apply)
+    {
+        apply(_settings);
+        FlushSave();
+        RestartHotkeys();
     }
 
     protected override void OnEnabled()
     {
         _settings ??= LoadSettings<WidgetsSettings>();
-        _liveData ??= new LiveDataProvider();
-
-        foreach (var model in _settings.Widgets.Where(w => w.IsVisible))
-        {
-            var win = new WidgetWindow(model, _liveData!, SaveAll, AddWidgetFromEditor, ExportWidget, ImportWidget);
-            win.Show();
-            _windows.Add(win);
-        }
+        if (_settings.AllHidden) return;
+        foreach (var model in _settings.Widgets.Where(w => w.Visible))
+            ShowWindow(model);
     }
 
     protected override void OnDisabled()
     {
-        foreach (var win in _windows.ToList())
-        {
-            win.Close();
-            _windows.Remove(win);
-        }
-    }
-
-    private void ToggleEditMode()
-    {
-        _editMode = !_editMode;
-        foreach (var win in _windows)
-        {
-            win.SetEditMode(_editMode);
-            if (_editMode && !win.IsVisible) win.Show();
-        }
-        Services.Overlay.ShowToast(_editMode ? "Режим редактирования включён" : "Изменения сохранены", "Виджеты");
-        if (!_editMode) OnWidgetChanged();
-    }
-
-    private void SaveAll() => SaveSettings(_settings);
-
-    public IReadOnlyList<HotkeySlot> HotkeySlots =>
-    [
-        new HotkeySlot("Включить/выключить режим редактирования",
-            () => _settings.HotkeyEditMode,
-            g => { _settings.HotkeyEditMode = g; SaveSettings(_settings); RestartHotkeys(); })
-    ];
-
-    public FrameworkElement BuildEditor()
-    {
-        var panel = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
-
-        var openEditorBtn = new Button { Content = "Открыть редактор", HorizontalAlignment = HorizontalAlignment.Left };
-        openEditorBtn.Click += (_, _) =>
-        {
-            var template = _settings.Widgets.FirstOrDefault() ?? new WidgetModel();
-            var editor = new WidgetsEditorWindow(template, _liveData!, SaveAll, AddWidgetFromEditor, ExportWidget, ImportWidget);
-            editor.Show();
-        };
-        panel.Children.Add(openEditorBtn);
-
-        panel.Children.Add(SettingsUi.Section("СПИСОК ВИДЖЕТОВ"));
-
-        _chipsHost = new WrapPanel { Margin = new Thickness(0, 4, 0, 0) };
-        RefreshChips();
-        panel.Children.Add(_chipsHost);
-
-        WidgetListChanged += RefreshChips;
-        panel.Unloaded += (_, _) => WidgetListChanged -= RefreshChips;
-
-        if (_settings.Widgets.Count == 0)
-        {
-            panel.Children.Add(new TextBlock
-            {
-                Text = "Виджетов пока нет. Откройте редактор и нажмите «Добавить виджет».",
-                Foreground = JarvisTheme.ForegroundBrush(0.4),
-                FontSize = 12.5,
-                FontStyle = FontStyles.Italic,
-                Margin = new Thickness(0, 8, 0, 0),
-                TextWrapping = TextWrapping.Wrap
-            });
-        }
-
-        return panel;
-    }
-
-    private void RefreshChips()
-    {
-        if (_chipsHost == null) return;
-
-        var parent = _chipsHost.Parent as StackPanel;
-        if (parent == null) return;
-
-        int idx = parent.Children.IndexOf(_chipsHost);
-        while (parent.Children.Count > idx)
-            parent.Children.RemoveAt(parent.Children.Count - 1);
-
-        _chipsHost = new WrapPanel { Margin = new Thickness(0, 4, 0, 0) };
-        parent.Children.Add(_chipsHost);
-
-        foreach (var widget in _settings.Widgets)
-            _chipsHost.Children.Add(BuildWidgetChip(widget));
-
-        if (_settings.Widgets.Count == 0)
-        {
-            parent.Children.Add(new TextBlock
-            {
-                Text = "Виджетов пока нет. Откройте редактор и нажмите «Добавить виджет».",
-                Foreground = JarvisTheme.ForegroundBrush(0.4),
-                FontSize = 12.5,
-                FontStyle = FontStyles.Italic,
-                Margin = new Thickness(0, 8, 0, 0),
-                TextWrapping = TextWrapping.Wrap
-            });
-        }
-    }
-
-    private UIElement BuildWidgetChip(WidgetModel widget)
-    {
-        var toggle = new JarvisToggleSwitch
-        {
-            IsChecked = widget.IsVisible,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        toggle.Checked += (_, _) => { widget.IsVisible = true; ShowWidget(widget); OnWidgetChanged(); WidgetListChanged?.Invoke(); };
-        toggle.Unchecked += (_, _) => { widget.IsVisible = false; HideWidget(widget); OnWidgetChanged(); WidgetListChanged?.Invoke(); };
-
-        var name = new TextBlock
-        {
-            Text = widget.Name,
-            Foreground = JarvisTheme.ForegroundBrush(0.92),
-            FontSize = 12.5,
-            MaxWidth = 200,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            ToolTip = "Клик — открыть в редакторе",
-            VerticalAlignment = VerticalAlignment.Center,
-            Cursor = Cursors.Hand,
-            Margin = new Thickness(10, 0, 0, 0)
-        };
-        name.MouseLeftButtonUp += (_, e) =>
-        {
-            e.Handled = true;
-            new WidgetsEditorWindow(widget, _liveData!, SaveAll, AddWidgetFromEditor, ExportWidget, ImportWidget).Show();
-        };
-
-        var remove = new TextBlock
-        {
-            Text = "✕",
-            FontSize = 11,
-            Foreground = JarvisTheme.ForegroundBrush(0.45),
-            Margin = new Thickness(10, 0, 2, 0),
-            VerticalAlignment = VerticalAlignment.Center,
-            Cursor = Cursors.Hand,
-            ToolTip = "Удалить виджет"
-        };
-        remove.MouseEnter += (_, _) => remove.Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0x7A, 0x7A));
-        remove.MouseLeave += (_, _) => remove.Foreground = JarvisTheme.ForegroundBrush(0.45);
-        remove.MouseLeftButtonUp += (_, e) =>
-        {
-            e.Handled = true;
-            _settings.Widgets.Remove(widget);
-            HideWidget(widget);
-            OnWidgetChanged();
-            WidgetListChanged?.Invoke();
-        };
-
-        var brush = new SolidColorBrush(Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF));
-        var chip = new Border
-        {
-            Background = brush,
-            BorderBrush = JarvisTheme.Solid(JarvisTheme.Accent, 0.30),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(11),
-            Padding = new Thickness(10, 5, 7, 5),
-            Margin = new Thickness(0, 0, 6, 6),
-            Child = new StackPanel { Orientation = Orientation.Horizontal }
-        };
-        ((StackPanel)chip.Child).Children.Add(toggle);
-        ((StackPanel)chip.Child).Children.Add(name);
-        ((StackPanel)chip.Child).Children.Add(remove);
-
-        chip.MouseEnter += (_, _) => brush.BeginAnimation(SolidColorBrush.ColorProperty,
-            new ColorAnimation(Color.FromArgb(0x26, 0x00, 0xD2, 0xFF), TimeSpan.FromMilliseconds(90)));
-        chip.MouseLeave += (_, _) => brush.BeginAnimation(SolidColorBrush.ColorProperty,
-            new ColorAnimation(Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF), TimeSpan.FromMilliseconds(130)));
-
-        return chip;
-    }
-
-    private void AddWidgetFromEditor(WidgetModel source)
-    {
-        var copy = CloneWidget(source);
-        _settings.Widgets.Add(copy);
-        OnWidgetChanged();
-        ShowWidget(copy);
-        WidgetListChanged?.Invoke();
-        Services.Overlay.ShowToast($"Добавлен виджет: {copy.Name}", "Виджеты");
-    }
-
-    private static WidgetModel CloneWidget(WidgetModel source)
-    {
-        return new WidgetModel
-        {
-            Name = source.Name,
-            Width = source.Width,
-            Height = source.Height,
-            Opacity = source.Opacity,
-            IsVisible = true,
-            Script = source.Script,
-            Elements = source.Elements.Select(e => new WidgetElement
-            {
-                Type = e.Type,
-                X = e.X, Y = e.Y,
-                Width = e.Width, Height = e.Height,
-                Text = e.Text,
-                Binding = e.Binding,
-                Background = e.Background,
-                Foreground = e.Foreground,
-                FontSize = e.FontSize,
-                CornerRadius = e.CornerRadius
-            }).ToList(),
-            Vars = new Dictionary<string, object>(source.Vars)
-        };
-    }
-
-    // Пункт 2: Экспорт/Импорт только одного виджета
-    private void ExportWidget(WidgetModel model)
-    {
-        try
-        {
-            var json = JsonSerializer.Serialize(model, SettingsStore.JsonOptions);
-            Clipboard.SetText(json);
-            Services.Overlay.ShowToast("Виджет скопирован в буфер обмена", "Виджеты");
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"export widget: {ex.Message}");
-            Services.Overlay.ShowToast("Ошибка экспорта", "Виджеты");
-        }
-    }
-
-    private void ImportWidget(WidgetModel target)
-    {
-        try
-        {
-            if (!Clipboard.ContainsText())
-            {
-                Services.Overlay.ShowToast("Буфер обмена пуст", "Виджеты");
-                return;
-            }
-            var json = Clipboard.GetText();
-            var imported = JsonSerializer.Deserialize<WidgetModel>(json, SettingsStore.JsonOptions);
-            if (imported == null)
-            {
-                Services.Overlay.ShowToast("Невалидный JSON", "Виджеты");
-                return;
-            }
-
-            // Сохраняем ID и IsVisible, чтобы не ломать ссылки на окна
-            imported.Id = target.Id;
-            imported.IsVisible = target.IsVisible;
-
-            target.Name = imported.Name;
-            target.Width = imported.Width;
-            target.Height = imported.Height;
-            target.Opacity = imported.Opacity;
-            target.Script = imported.Script;
-            target.Elements = imported.Elements;
-            target.Vars = imported.Vars;
-
-            OnWidgetChanged();
-
-            var existingWin = _windows.FirstOrDefault(w => w.Model == target);
-            if (existingWin != null)
-            {
-                existingWin.Close();
-                _windows.Remove(existingWin);
-                if (target.IsVisible)
-                {
-                    var win = new WidgetWindow(target, _liveData!, SaveAll, AddWidgetFromEditor, ExportWidget, ImportWidget);
-                    _windows.Add(win);
-                    win.Show();
-                }
-            }
-
-            WidgetListChanged?.Invoke();
-            Services.Overlay.ShowToast($"Виджет импортирован", "Виджеты");
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"import widget: {ex.Message}");
-            Services.Overlay.ShowToast("Ошибка импорта: " + ex.Message, "Виджеты");
-        }
-    }
-
-    private void ShowWidget(WidgetModel model)
-    {
-        var existing = _windows.FirstOrDefault(w => w.Model == model);
-        if (existing == null)
-        {
-            var win = new WidgetWindow(model, _liveData!, SaveAll, AddWidgetFromEditor, ExportWidget, ImportWidget);
-            _windows.Add(win);
-            win.Show();
-        }
-        else existing.Show();
-    }
-    
-    private void OnWidgetChanged()
-    {
-        SaveAll();
-        foreach (var win in _windows.ToList())
-            win.Rebuild();
-    }
-
-    private void HideWidget(WidgetModel model)
-    {
-        var existing = _windows.FirstOrDefault(w => w.Model == model);
-        existing?.Hide();
+        FlushSave();
+        foreach (var win in _windows.Values.ToList()) win.Close();
+        _windows.Clear();
     }
 
     public override void Shutdown()
     {
         base.Shutdown();
-        foreach (var win in _windows) win.Close();
+        FlushSave(sync: true);
+        foreach (var win in _windows.Values.ToList()) win.Close();
     }
+
+    // ══════════════ создание ══════════════
+
+    /// <summary>Новая заметка: рядом с заметкой-«родителем» или у курсора; сразу в режиме ввода.</summary>
+    public void CreateNote(WidgetWindow? near)
+    {
+        if (!IsEnabled) return;
+        var model = new WidgetModel
+        {
+            Kind = WidgetKind.Note,
+            Name = "Заметка",
+            Width = 240,
+            Height = 190,
+            Layer = WidgetLayer.Topmost,
+            Color = near?.Model.Color ?? NotePalette.Default.Hex
+        };
+        if (near != null)
+        {
+            model.X = near.Left + near.ActualWidth + 10;
+            model.Y = near.Top;
+        }
+        else PlaceAtCursor(model);
+
+        var win = AddWidget(model);
+        win?.Dispatcher.BeginInvoke(win.FocusNote, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>Выделить область экрана и закрепить её поверх окон — ровно на том же месте.</summary>
+    public void PinScreenshot(Action? done = null)
+    {
+        if (!IsEnabled) { done?.Invoke(); return; }
+        ScreenCapture.SelectRegion(Services.Hotkeys, (_, crop, rect) =>
+        {
+            AddImage(crop, rect.X / DpiUtil.Scale, rect.Y / DpiUtil.Scale, $"Скриншот {DateTime.Now:HH:mm}");
+            done?.Invoke();
+        }, done);
+    }
+
+    public void PinClipboardImage()
+    {
+        var image = Services.Clipboard.GetImage();
+        if (image == null)
+        {
+            Services.Overlay.ShowToast("В буфере обмена нет картинки", "Виджеты");
+            return;
+        }
+        var model = new WidgetModel();
+        PlaceAtCursor(model);
+        AddImage(image, model.X, model.Y, $"Картинка {DateTime.Now:HH:mm}");
+    }
+
+    private void AddImage(BitmapSource image, double x, double y, string name)
+    {
+        if (image.CanFreeze && !image.IsFrozen) image.Freeze();
+        var model = new WidgetModel
+        {
+            Kind = WidgetKind.Image,
+            Name = name,
+            X = x,
+            Y = y,
+            Width = Math.Max(48, image.PixelWidth / DpiUtil.Scale),  // 1:1 с экраном — без размытия
+            Height = Math.Max(32, image.PixelHeight / DpiUtil.Scale),
+            Layer = WidgetLayer.Topmost
+        };
+        model.ImageFile = model.Id + ".png";
+
+        // PNG пишется в фоне; окно показывает картинку из памяти сразу
+        var path = Path.Combine(WidgetPaths.ImagesDir, model.ImageFile);
+        Task.Run(() =>
+        {
+            try
+            {
+                Directory.CreateDirectory(WidgetPaths.ImagesDir);
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(image));
+                using var fs = File.Create(path);
+                encoder.Save(fs);
+            }
+            catch (Exception ex) { Log.Error($"виджеты: сохранение картинки: {ex.Message}"); }
+        });
+
+        AddWidget(model, image);
+    }
+
+    public void CreateFromTemplate(WidgetTemplate template, bool openEditor = false)
+    {
+        if (!IsEnabled) return;
+        var wa = SystemParameters.WorkArea;
+        int step = _cascade++ % 6 * 28;
+        var model = new WidgetModel
+        {
+            Kind = WidgetKind.Custom,
+            Name = template.Name,
+            Width = template.Width,
+            Height = template.Height,
+            Layer = template.Layer,
+            Xaml = template.Xaml,
+            Script = template.Script,
+            X = wa.Left + (wa.Width - template.Width) / 2 + step,
+            Y = wa.Top + wa.Height / 4 + step
+        };
+        AddWidget(model);
+        if (openEditor) Edit(model);
+    }
+
+    private WidgetWindow? AddWidget(WidgetModel model, BitmapSource? preloaded = null)
+    {
+        _settings.Widgets.Add(model);
+        if (_settings.AllHidden) ShowAllInternal(true);
+        var win = ShowWindow(model, preloaded, animate: true);
+        ScheduleSave();
+        Changed?.Invoke();
+        return win;
+    }
+
+    private void PlaceAtCursor(WidgetModel model)
+    {
+        WinApi.GetCursorPos(out var p);
+        model.X = p.X / DpiUtil.Scale - 20;
+        model.Y = p.Y / DpiUtil.Scale - 12;
+    }
+
+    // ══════════════ окна ══════════════
+
+    private WidgetWindow? ShowWindow(WidgetModel model, BitmapSource? preloaded = null, bool animate = false)
+    {
+        if (_windows.TryGetValue(model.Id, out var existing)) return existing;
+        try
+        {
+            var win = new WidgetWindow(model, this, preloaded, animate);
+            _windows[model.Id] = win;
+            win.Closed += (_, _) =>
+            {
+                if (_windows.TryGetValue(model.Id, out var w) && ReferenceEquals(w, win)) _windows.Remove(model.Id);
+            };
+            win.Show();
+            if (_editMode) win.SetEditMode(true);
+            return win;
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"виджет «{model.Name}» не открылся: {ex}");
+            return null;
+        }
+    }
+
+    private void CloseWindow(WidgetModel model)
+    {
+        if (_windows.Remove(model.Id, out var win)) win.Close();
+    }
+
+    internal IEnumerable<IntPtr> OtherWidgetRects(WidgetWindow except) =>
+        _windows.Values.Where(w => !ReferenceEquals(w, except) && w.IsVisible && w.Handle != IntPtr.Zero).Select(w => w.Handle);
+
+    // ══════════════ управление ══════════════
+
+    public void SetVisible(WidgetModel model, bool visible)
+    {
+        model.Visible = visible;
+        if (visible)
+        {
+            if (_settings.AllHidden) ShowAllInternal(true);
+            else ShowWindow(model, animate: true);
+        }
+        else CloseWindow(model);
+        ScheduleSave();
+        Changed?.Invoke();
+    }
+
+    public void Hide(WidgetModel model) => SetVisible(model, false);
+
+    public void Delete(WidgetModel model)
+    {
+        _settings.Widgets.Remove(model);
+        CloseWindow(model);
+        WidgetEditorWindow.CloseFor(model);
+        if (model.ImageFile is { } file && _settings.Widgets.All(w => w.ImageFile != file))
+        {
+            var path = Path.Combine(WidgetPaths.ImagesDir, file);
+            Task.Run(() => { try { File.Delete(path); } catch { /* файл занят — не критично */ } });
+        }
+        ScheduleSave();
+        Changed?.Invoke();
+    }
+
+    public void Duplicate(WidgetModel model)
+    {
+        var copy = model.Clone();
+        copy.Name = model.Name;
+        copy.X += 24;
+        copy.Y += 24;
+        copy.Visible = true;
+        AddWidget(copy);
+    }
+
+    public void Rename(WidgetModel model, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name == model.Name) return;
+        model.Name = name.Trim();
+        if (_windows.TryGetValue(model.Id, out var win)) win.ReloadContent();
+        ScheduleSave();
+        Changed?.Invoke();
+    }
+
+    /// <summary>«Редактировать»: свой виджет — редактор, заметка — фокус в текст, картинка — подсветка.</summary>
+    public void Edit(WidgetModel model)
+    {
+        switch (model.Kind)
+        {
+            case WidgetKind.Custom:
+                WidgetEditorWindow.Open(model, this);
+                break;
+            case WidgetKind.Note:
+                if (!model.Visible || _settings.AllHidden) SetVisible(model, true);
+                if (_windows.TryGetValue(model.Id, out var note)) note.FocusNote();
+                break;
+            default:
+                Locate(model);
+                break;
+        }
+    }
+
+    public void Locate(WidgetModel model)
+    {
+        if (!model.Visible || _settings.AllHidden) SetVisible(model, true);
+        if (_windows.TryGetValue(model.Id, out var win)) win.Flash();
+    }
+
+    /// <summary>Редактор сохранил изменения — перезагрузить окно.</summary>
+    internal void ApplyEdit(WidgetModel model)
+    {
+        if (_windows.TryGetValue(model.Id, out var win)) win.ReloadContent();
+        ScheduleSave();
+        Changed?.Invoke();
+    }
+
+    public void ToggleEditMode()
+    {
+        _editMode = !_editMode;
+        foreach (var win in _windows.Values) win.SetEditMode(_editMode);
+        Services.Overlay.ShowToast(_editMode
+            ? "Режим редактирования: рамки видны, сквозные клики и блокировка временно отключены"
+            : "Режим редактирования выключен", "Виджеты");
+        Changed?.Invoke();
+    }
+
+    public void ToggleAll()
+    {
+        ShowAllInternal(_settings.AllHidden);
+        Services.Overlay.ShowToast(_settings.AllHidden ? "Виджеты скрыты" : "Виджеты показаны", "Виджеты", 1100);
+    }
+
+    private void ShowAllInternal(bool show)
+    {
+        _settings.AllHidden = !show;
+        if (show)
+            foreach (var model in _settings.Widgets.Where(w => w.Visible)) ShowWindow(model, animate: true);
+        else
+            foreach (var win in _windows.Values.ToList()) win.Close();
+        ScheduleSave();
+        Changed?.Invoke();
+    }
+
+    // ══════════════ сохранение ══════════════
+
+    /// <summary>
+    /// Отложенное сохранение: перетаскивание, набор текста и т.п. дёргают его постоянно,
+    /// а на диск уходит один снимок через полсекунды тишины.
+    /// </summary>
+    internal void ScheduleSave()
+    {
+        if (_saveTimer == null)
+        {
+            _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SaveDelayMs) };
+            _saveTimer.Tick += (_, _) => FlushSave();
+        }
+        _saveTimer.Stop();
+        _saveTimer.Start();
+    }
+
+    private void FlushSave(bool sync = false)
+    {
+        _saveTimer?.Stop();
+        if (_settings == null) return;
+        // сериализация — на UI-потоке (модели меняются только здесь), запись — в фоне
+        string json;
+        try { json = JsonSerializer.Serialize(_settings, SettingsStore.JsonOptions); }
+        catch (Exception ex) { Log.Error($"виджеты: сериализация: {ex.Message}"); return; }
+
+        var path = Services.Settings.GetFilePath(Name);
+        void Write()
+        {
+            lock (FileGate)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    File.WriteAllText(path + ".tmp", json);
+                    File.Move(path + ".tmp", path, overwrite: true);
+                }
+                catch (Exception ex) { Log.Error($"виджеты: запись настроек: {ex.Message}"); }
+            }
+        }
+        if (sync) Write(); else Task.Run(Write);
+    }
+
+    // ══════════════ настройки ══════════════
+
+    public FrameworkElement BuildEditor() => new WidgetsSettingsPage(this).Build();
 }

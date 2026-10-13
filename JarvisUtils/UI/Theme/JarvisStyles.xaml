@@ -7,8 +7,9 @@
     <SolidColorBrush x:Key="AccentDim" Color="#8C00D2FF"/>
     <SolidColorBrush x:Key="AccentSoft" Color="#2600D2FF"/>
     <SolidColorBrush x:Key="FgMain" Color="#E8FFFFFF"/>
-    <SolidColorBrush x:Key="FgDim" Color="#88FFFFFF"/>
-    <SolidColorBrush x:Key="FgFaint" Color="#55FFFFFF"/>
+    <!-- Непрозрачные: полупрозрачный белый текст в списках местами рендерился почти чёрным -->
+    <SolidColorBrush x:Key="FgDim" Color="#FF9DA3AE"/>
+    <SolidColorBrush x:Key="FgFaint" Color="#FF656B77"/>
     <SolidColorBrush x:Key="Line" Color="#FF2A2E3A"/>
     <SolidColorBrush x:Key="Hover" Color="#12FFFFFF"/>
 
@@ -176,7 +177,7 @@
 
     <!-- ══ ListBoxItem ══ -->
     <Style TargetType="ListBoxItem">
-        <Setter Property="Foreground" Value="{StaticResource FgDim}"/>
+        <Setter Property="Foreground" Value="#FFDDE1E8"/>
         <Setter Property="FontSize" Value="13"/>
         <Setter Property="Padding" Value="14,10"/>
         <Setter Property="Cursor" Value="Hand"/>
@@ -202,7 +203,7 @@
                         <Trigger Property="IsSelected" Value="True">
                             <Setter TargetName="Bd" Property="Background" Value="#1400D2FF"/>
                             <Setter TargetName="Strip" Property="Background" Value="{StaticResource Accent}"/>
-                            <Setter Property="Foreground" Value="{StaticResource FgMain}"/>
+                            <Setter Property="Foreground" Value="#FFFFFFFF"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -269,7 +270,7 @@
                             BorderBrush="{TemplateBinding BorderBrush}"
                             BorderThickness="{TemplateBinding BorderThickness}"
                             CornerRadius="8" Padding="{TemplateBinding Padding}">
-                        <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+                        <StackPanel IsItemsHost="True" Grid.IsSharedSizeScope="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
                     </Border>
                 </ControlTemplate>
             </Setter.Value>
@@ -277,10 +278,12 @@
     </Style>
 
     <!-- ══ MenuItem ══ -->
+    <!-- Иконка (Icon) или галочка (IsCheckable), подпись, InputGestureText и подменю.
+         Колонка иконки общая на всё меню (SharedSizeGroup) — пункты без иконок выровнены. -->
     <Style TargetType="MenuItem">
         <Setter Property="Foreground" Value="{StaticResource FgMain}"/>
         <Setter Property="FontSize" Value="13"/>
-        <Setter Property="Padding" Value="14,8"/>
+        <Setter Property="Padding" Value="12,7"/>
         <Setter Property="Cursor" Value="Hand"/>
         <Setter Property="Template">
             <Setter.Value>
@@ -290,15 +293,52 @@
                             CornerRadius="6" Margin="2,1">
                         <Grid>
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" SharedSizeGroup="Icon"/>
+                                <ColumnDefinition Width="Auto" SharedSizeGroup="MenuIcon"/>
                                 <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto" SharedSizeGroup="Shortcut"/>
+                                <ColumnDefinition Width="Auto" SharedSizeGroup="MenuGesture"/>
+                                <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
+                            <Grid x:Name="IconHost" Width="16" Margin="0,0,10,0" VerticalAlignment="Center">
+                                <ContentPresenter ContentSource="Icon" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                  TextElement.FontSize="14"/>
+                                <TextBlock x:Name="Check" Text="&#xE73E;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                                           FontSize="12" Foreground="{StaticResource Accent}" Visibility="Collapsed"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Grid>
                             <ContentPresenter Grid.Column="1" ContentSource="Header"
                                               RecognizesAccessKey="False" VerticalAlignment="Center"/>
+                            <TextBlock Grid.Column="2" Text="{TemplateBinding InputGestureText}"
+                                       Foreground="{StaticResource FgDim}" FontSize="11.5"
+                                       Margin="24,0,0,0" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="Arrow" Grid.Column="3" Text="&#xE76C;"
+                                       FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="10"
+                                       Foreground="{StaticResource FgDim}" Margin="14,0,0,0"
+                                       VerticalAlignment="Center" Visibility="Collapsed"/>
+                            <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="6" VerticalOffset="-8"
+                                   IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}"
+                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
+                                <Border Background="#FF1A1D26" BorderBrush="{StaticResource Line}"
+                                        BorderThickness="1" CornerRadius="8" Padding="2">
+                                    <StackPanel IsItemsHost="True" Grid.IsSharedSizeScope="True"
+                                                KeyboardNavigation.DirectionalNavigation="Cycle"/>
+                                </Border>
+                            </Popup>
                         </Grid>
                     </Border>
                     <ControlTemplate.Triggers>
+                        <MultiTrigger>
+                            <MultiTrigger.Conditions>
+                                <Condition Property="Icon" Value="{x:Null}"/>
+                                <Condition Property="IsCheckable" Value="False"/>
+                            </MultiTrigger.Conditions>
+                            <Setter TargetName="IconHost" Property="Visibility" Value="Collapsed"/>
+                        </MultiTrigger>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Check" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="Role" Value="SubmenuHeader">
+                            <Setter TargetName="Arrow" Property="Visibility" Value="Visible"/>
+                        </Trigger>
                         <Trigger Property="IsHighlighted" Value="True">
                             <Setter TargetName="Bd" Property="Background" Value="{StaticResource Hover}"/>
                         </Trigger>
@@ -324,6 +364,9 @@
             </Setter.Value>
         </Setter>
     </Style>
+
+    <!-- Внутри меню WPF берёт стиль разделителя по особому ключу, а не неявный -->
+    <Style x:Key="{x:Static MenuItem.SeparatorStyleKey}" TargetType="Separator" BasedOn="{StaticResource {x:Type Separator}}"/>
 
     <!-- ══ TabControl ══ -->
     <Style TargetType="TabControl">
